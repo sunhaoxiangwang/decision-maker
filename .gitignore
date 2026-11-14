@@ -1,7 +1,7 @@
 .env
 target/
 vexo-open-kit
-.venv/
+.venv*/
 __pycache__/
 node_modules/
 .next/

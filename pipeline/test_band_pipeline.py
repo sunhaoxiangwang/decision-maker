@@ -7,7 +7,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import band_pipeline as bp
 import importlib.util
-assert importlib.util.find_spec("vexo_open"), "run() imports vexo_open before speech is ever imported"
+if bp.KIT.exists():  # a clean checkout without the kit still runs the kit-free checks
+    assert importlib.util.find_spec("vexo_open"), "run() imports vexo_open before speech is ever imported"
 try:
     import speech
 except ModuleNotFoundError:
