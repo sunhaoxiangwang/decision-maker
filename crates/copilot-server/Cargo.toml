@@ -1,0 +1,28 @@
+[package]
+name = "copilot-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "copilot-server"
+
+[[bin]]
+name = "copilot-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+
+[dependencies]
+copilot-core = { path = "../copilot-core" }
+copilot-providers = { path = "../copilot-providers" }
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+maud = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

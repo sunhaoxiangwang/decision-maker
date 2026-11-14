@@ -1,0 +1,16 @@
+{
+  "name": "lunch (SIMULATED input, user-entered fixture)",
+  "mode": "lunch",
+  "prefs": [
+    {"kind": "allergen_peanut", "value": ""},
+    {"kind": "max_walk", "value": "1.0"},
+    {"kind": "prefer_veg", "value": ""}
+  ],
+  "steps": [
+    {"turn": "Let's pick lunch.", "expect": "SELECT", "expect_option": "B"},
+    {"turn": "Burger Barn is 0.8 miles away.", "expect": "SELECT", "expect_option": "B"},
+    {"set_fact": {"opt": "C", "kind": "distance", "value": "0.8"}, "expect": "SELECT", "expect_option": "B"},
+    {"turn": "Green Bowl is 1.01 miles away.", "expect": "SELECT", "expect_option": "C"},
+    {"turn": "Burger Barn closes at 1 pm.", "expect": "NO_ELIGIBLE_OPTION"}
+  ]
+}
