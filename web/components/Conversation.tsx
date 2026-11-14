@@ -1,26 +1,13 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
+import { fallbackName, useNames } from '@/lib/names';
 import { selectedTurn, visibleTurns, type State } from '@/lib/store';
 import CueBadge, { Dot } from './CueBadge';
 
 const COLORS = ['#10a37f', '#5436da', '#e2622b', '#d6336c', '#0b84d8', '#8a7300'];
 
-// Speaker names are a per-viewer convenience, so localStorage is enough.
-function useNames() {
-  const [names, setNames] = useState<Record<string, string>>({});
-  useEffect(() => {
-    try { setNames(JSON.parse(localStorage.getItem('speakerNames') ?? '{}') || {}); } catch { /* storage blocked */ }
-  }, []);
-  const rename = (key: string, name: string) => {
-    const next = { ...names, [key]: name };
-    setNames(next);
-    try { localStorage.setItem('speakerNames', JSON.stringify(next)); } catch { /* storage blocked */ }
-  };
-  return [names, rename] as const;
-}
-
 export default function Conversation({ state, onPick }: { state: State; onPick: (turn_id: number) => void }) {
-  const [names, rename] = useNames();
+  const { names, rename } = useNames();
   const end = useRef<HTMLDivElement>(null);
   const turns = visibleTurns(state);
   const last = turns.at(-1);
@@ -34,7 +21,7 @@ export default function Conversation({ state, onPick }: { state: State; onPick: 
         const d = t.decisionId ? state.decisions[t.decisionId] : undefined;
         const cue = t.cue ?? d?.cue;
         const key = String(t.speaker ?? 'unknown');
-        const fallback = t.speaker == null ? 'Unknown speaker' : `Speaker ${t.speaker + 1}`;
+        const fallback = fallbackName(t.speaker);
         const name = names[key] ?? '';
         // Speech arrives as one turn per pause, so one person often fills several turns in
         // a row: name them once, until someone else speaks or the agent answers.

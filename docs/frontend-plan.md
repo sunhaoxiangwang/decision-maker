@@ -74,7 +74,7 @@ The UI should code against these shapes and fall back gracefully until they exis
 | 5 | Mic and band status | Python pipeline → bridge publish | Server-Sent Events, event `status` | **Proposed** |
 | 6 | Set mode, goals and lunch options | Orchestrator `POST /session` | HTTP JSON | **Proposed** |
 | 7 | Past decisions | Orchestrator `GET /decisions?mode=&cue=&session=`, `GET /decisions/:id` | HTTP JSON | **Proposed** |
-| 8 | Memory store | Orchestrator `GET /memory`, `POST /memory/:id/confirm`, `PATCH /memory/:id`, `DELETE /memory/:id` | HTTP JSON | **Proposed** |
+| 8 | Memory for decisions | UI → orchestrator `POST /api/memory` with every confirmed note whenever memory changes. The memory itself lives in the browser (see `docs/memory.md`) | HTTP JSON | UI side **built**, orchestrator **proposed** |
 | 9 | Catch up after a reload | Orchestrator `GET /session/transcript` (the Server-Sent Events stream has no backlog) | HTTP JSON | **Proposed** |
 
 ### Connection rules (already enforced by the bridge)
@@ -111,15 +111,12 @@ type DecisionEvent = {
   latency_ms: { transcript_to_decision: number; decision_to_led?: number };
   time_ms: number;
 };
-type MemoryRef = { id: string; key: string; value: string; source: string; retrieved_ms: number };
+type MemoryRef = { id: string; text: string; retrieved_ms: number };  // see docs/memory.md
 type MemoryEvent = { type: 'memory'; op: 'proposed' | 'confirmed' | 'updated' | 'deleted'; item: MemoryItem };
 type StatusEvent = { type: 'status'; band: 'connected' | 'reconnecting' | 'off'; mic: 'live' | 'cue-hold' | 'off' };
 
 // Proposed: HTTP JSON
-type MemoryItem = {
-  id: string; key: string; value: string; status: 'confirmed' | 'proposed';
-  source: string; saved_ms: number; last_used_ms?: number; used_by: number;
-};
+// MemoryItem: a sentence about one subject. Built: see docs/memory.md and web/lib/store.ts.
 type Session = {
   mode: 'negotiation' | 'lunch';
   goals: { key: string; value: string; confirmed: boolean }[];  // e.g. budget_total ≤ 1200

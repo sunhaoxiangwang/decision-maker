@@ -49,11 +49,30 @@ test('a pinned turn stays selected; unpinning follows the latest', () => {
 });
 
 test('memory events add and delete items', () => {
-  const item = { id: 'm1', key: 'k', value: 'v', status: 'proposed' as const, source: 'summary', saved_ms: 1, used_by: 0 };
+  const item = { id: 'm1', kind: 'fact' as const, subject: 'Seller', text: 'Delivery costs $50.', keywords: ['delivery'], status: 'proposed' as const, source: { type: 'user' as const }, saved_ms: 1 };
   let s = run([{ type: 'memory', op: 'proposed', item }, { type: 'memory', op: 'confirmed', item: { ...item, status: 'confirmed' } }]);
   assert.equal(s.memory.m1.status, 'confirmed');
   s = reducer(s, { type: 'memory', op: 'deleted', item });
   assert.equal(s.memory.m1, undefined);
+});
+
+test('final turns are kept in a conversation; a bridge restart or New conversation starts another', () => {
+  const say = (turn_id: number, text: string, final = true, speaker = 0): Action => ({ type: 'transcript', turn_id, speaker, text, final, time_ms: turn_id });
+  let s = run([say(1, 'hi', false), say(1, 'hi'), say(2, '', true), say(2, 'I can do $1,150', true, 1)]);
+  const first = s.conversations[s.current!];
+  assert.deepEqual(first.turns.map((t) => [t.turn_id, t.speaker, t.text]), [[1, 0, 'hi'], [2, 1, 'I can do $1,150']]); // no interim, no empty
+  s = reducer(s, say(1, 'new run')); // the bridge counts from 1 again
+  assert.notEqual(s.current, first.id);
+  assert.equal(Object.keys(s.conversations).length, 2);
+  assert.deepEqual(Object.keys(s.turns), ['1']);                  // old run's turns left the screen
+  s = run([{ type: 'new-conversation' }, say(2, 'after the button')], s);
+  assert.equal(Object.keys(s.conversations).length, 3);
+});
+
+test('old key/value memory is dropped on load, conversations are restored', () => {
+  const conv = { id: 'c1', started_ms: 1, mode: 'negotiation' as const, turns: [] };
+  const s = reducer(initial, { type: 'load', saved: { memory: { old: { id: 'old', key: 'k', value: 'v' } } as never, conversations: { c1: conv }, current: 'c1' } });
+  assert.deepEqual([Object.keys(s.memory), s.current, s.conversations.c1.id], [[], 'c1', 'c1']);
 });
 
 test('empty interim guesses (silence) draw no turn', () => {

@@ -1,9 +1,12 @@
 'use client';
+import Link from 'next/link';
 import { useState } from 'react';
 import Conversation from '@/components/Conversation';
 import DecisionCard from '@/components/DecisionCard';
 import GoalsForm from '@/components/GoalsForm';
 import { setSession } from '@/lib/api';
+import { decisionRequest } from '@/lib/memory';
+import { useNames } from '@/lib/names';
 import { selectedTurn, visibleTurns, type Mode, type Session } from '@/lib/store';
 import { useBridge } from '@/lib/useBridge';
 
@@ -13,6 +16,7 @@ export default function Live() {
   const { state, dispatch, link } = useBridge();
   const [offline, setOffline] = useState(false);
   const { session, status } = state;
+  const { name } = useNames();
 
   const save = (next: Session, post: boolean) => {
     dispatch({ type: 'session', session: next });
@@ -24,6 +28,11 @@ export default function Live() {
   const d = turn?.decisionId ? state.decisions[turn.decisionId] : undefined;
   const goalsOk = session.goals.length > 0 && session.goals.every((g) => g.confirmed);
   const empty = visibleTurns(state).length === 0;
+  // What the decision API would be sent for the selected (or latest) finished turn: the
+  // memory shown here is exactly what retrieval picks for it.
+  const conv = state.current ? state.conversations[state.current] : undefined;
+  const at = sel ?? conv?.turns.at(-1)?.turn_id;
+  const request = conv && at != null ? decisionRequest(conv, at, Object.values(state.memory), name) : null;
   // Safety rule: always disclose a live mic. If nobody has reported the mic state but the
   // bridge is up, assume it is live.
   const micUnknown = !status && link === 'open';
@@ -38,6 +47,10 @@ export default function Live() {
           </select>
           <span className="chip">{goalsOk ? 'Goals ✓' : 'Goals not confirmed'}</span>
           <span className={`chip${status?.mic === 'live' ? ' rec' : ''}`}>{status ? MIC[status.mic] : 'Mic unknown'}</span>
+          {!empty && (
+            <button className="ghost" title="Keep this conversation in Memory › Past conversations and start a new one"
+              onClick={() => dispatch({ type: 'new-conversation' })}>New conversation</button>
+          )}
         </header>
         {(status?.mic === 'live' || micUnknown) && (
           <div className="banner" role="status">
@@ -76,6 +89,25 @@ export default function Live() {
         {sel == null
           ? <p className="muted">The latest decision shows here: the cue, why, and the facts and memory it used. Click any turn to pin its decision.</p>
           : <DecisionCard turn={turn} d={d} options={session.lunch_options} />}
+        <section>
+          <h3>Memory for {request ? `turn ${request.turn.turn_id} · ${request.turn.speaker}` : 'the next turn'}</h3>
+          {!request || request.memory.length === 0 ? (
+            <p className="muted">
+              {Object.keys(state.memory).length === 0
+                ? <>No memory yet. Add context or remember a past conversation in <Link href="/memory">Memory</Link>.</>
+                : 'No confirmed memory matches this turn.'}
+            </p>
+          ) : (
+            <ul>
+              {request.memory.map((m) => (
+                <li key={m.id}>
+                  <Link href={`/memory#m-${encodeURIComponent(m.id)}`}>{m.text}</Link>
+                  <small> · {m.kind} · {m.subject}</small>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       </aside>
     </div>
   );

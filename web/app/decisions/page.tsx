@@ -37,7 +37,7 @@ function Decisions() {
             {Object.entries(CUES).map(([cue, { label }]) => <option key={cue} value={cue}>{label}</option>)}
           </select>
           <input type="date" aria-label="Day" value={filter.day} onChange={set('day')} />
-          {memoryId && <Link className="chip" href="/decisions">Using memory {state.memory[memoryId]?.key ?? memoryId} ×</Link>}
+          {memoryId && <Link className="chip" href="/decisions">Using memory {state.memory[memoryId]?.text ?? memoryId} ×</Link>}
           {all.length > 0 && (
             <button className="ghost" onClick={() => confirm(`Delete all ${all.length} saved decisions from this browser?`) && dispatch({ type: 'forget-decisions' })}>
               Clear history

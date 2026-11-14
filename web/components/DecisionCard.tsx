@@ -66,8 +66,8 @@ export default function DecisionCard({ turn, d, options }: { turn?: Turn; d?: De
             <ul>
               {d.memory_used.map((m) => (
                 <li key={m.id}>
-                  <Link href={`/memory#m-${encodeURIComponent(m.id)}`}>{m.key}</Link> {m.value}
-                  <small> · {m.source} · retrieved {ago(m.retrieved_ms)}</small>
+                  <Link href={`/memory#m-${encodeURIComponent(m.id)}`}>{m.text}</Link>
+                  <small> · retrieved {ago(m.retrieved_ms)}</small>
                 </li>
               ))}
             </ul>

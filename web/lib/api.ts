@@ -1,10 +1,45 @@
-// The one orchestrator call (PROPOSED in docs/frontend-plan.md): tell it the mode, goals and
-// lunch options. Reached through the /api rewrite in next.config.mjs; throws when the
-// orchestrator isn't there. Past decisions and memory are NOT fetched: they are kept in
-// this browser (see lib/useBridge.tsx).
-import type { Session } from './store';
+// Calls from the browser.
+// - setSession, syncMemory: the orchestrator (PROPOSED in docs/frontend-plan.md), reached
+//   through the /api rewrite in next.config.mjs; they throw when it isn't there.
+// - extractMemory: this app's own server route, app/llm/memory/route.ts (OpenAI).
+import { MEMORY_KINDS, type MemoryItem, type MemorySource, type Session } from './store';
+import type { DecisionMemory } from './memory';
+
+const post = (url: string, body: unknown) =>
+  fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
 export async function setSession(session: Session): Promise<void> {
-  const r = await fetch('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(session) });
+  const r = await post('/api/session', session);
   if (!r.ok) throw new Error(`orchestrator answered ${r.status}`);
+}
+
+/** Keeps the orchestrator's copy of confirmed memory current, so decisions can use it. */
+export async function syncMemory(memories: DecisionMemory[]): Promise<void> {
+  const r = await post('/api/memory', { memories });
+  if (!r.ok) throw new Error(`orchestrator answered ${r.status}`);
+}
+
+type Extracted = { kind: string; subject: string; text: string; keywords: string[]; turn_ids: number[] };
+
+/** Memory notes from a conversation transcript or from typed context, as new items. */
+export async function extractMemory(
+  input: { source: 'conversation'; conversation_id: string; transcript: string } | { source: 'user'; text: string },
+): Promise<MemoryItem[]> {
+  const r = await post('/llm/memory', input);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error ?? `memory extraction answered ${r.status}`);
+  const now = Date.now();
+  return (j.memories as Extracted[])
+    .filter((m) => typeof m?.text === 'string' && m.text.trim() && MEMORY_KINDS.includes(m.kind as MemoryItem['kind']))
+    .map((m) => {
+      const source: MemorySource = input.source === 'user'
+        ? { type: 'user' }
+        : { type: 'conversation', conversation_id: input.conversation_id, turn_ids: m.turn_ids ?? [] };
+      return {
+        id: crypto.randomUUID(), kind: m.kind as MemoryItem['kind'], subject: m.subject || 'user', text: m.text.trim(),
+        keywords: (m.keywords ?? []).map((k) => k.toLowerCase()), source, saved_ms: now,
+        // What the user typed is theirs to trust; what was heard waits for confirmation.
+        status: input.source === 'user' ? 'confirmed' : 'proposed',
+      };
+    });
 }

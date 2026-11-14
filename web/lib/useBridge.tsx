@@ -2,11 +2,13 @@
 // One EventSource for the whole app. Read directly from the bridge (never through a
 // Next.js rewrite). The bridge only answers its BRIDGE_UI_ORIGIN, so open the UI there.
 //
-// Decisions, memory and the session's goals are stored in this browser's localStorage:
-// that is where the Decisions and Memory tabs read the past from.
+// Decisions, memory, past conversations and the session's goals are stored in this
+// browser's localStorage: that is where the Decisions and Memory tabs read the past from.
 // ponytail: localStorage holds about 5 MB and is per browser; move to the orchestrator's
 // store (or IndexedDB) when history outgrows that or must be shared.
 import { createContext, useContext, useEffect, useReducer, useState, type Dispatch, type ReactNode } from 'react';
+import { syncMemory } from './api';
+import { forDecision } from './memory';
 import { BRIDGE_EVENTS, initial, reducer, type Action, type Saved, type State } from './store';
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? 'http://127.0.0.1:8787/events';
@@ -42,11 +44,17 @@ export function BridgeProvider({ children }: { children: ReactNode }) {
     return () => es.close();
   }, []);
 
-  const { loaded, decisions, memory, session } = state;
+  const { loaded, decisions, memory, session, conversations, current } = state;
   useEffect(() => {
     if (!loaded) return; // never overwrite the saved copy before it has been read
-    try { localStorage.setItem(KEY, JSON.stringify({ decisions, memory, session } satisfies Saved)); } catch { /* full or blocked */ }
-  }, [loaded, decisions, memory, session]);
+    try { localStorage.setItem(KEY, JSON.stringify({ decisions, memory, session, conversations, current } satisfies Saved)); } catch { /* full or blocked */ }
+  }, [loaded, decisions, memory, session, conversations, current]);
+
+  // The orchestrator keeps its own copy of confirmed memory for decisions. Not there yet: fine.
+  useEffect(() => {
+    if (!loaded) return;
+    syncMemory(forDecision(Object.values(memory).filter((m) => m.status === 'confirmed'))).catch(() => {});
+  }, [loaded, memory]);
 
   return <Ctx.Provider value={{ state, dispatch, link }}>{children}</Ctx.Provider>;
 }

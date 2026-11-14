@@ -10,7 +10,7 @@ export type TranscriptEvent = {
   text: string; final: boolean; time_ms: number;
 };
 export type CueEvent = { type: 'cue'; turn_id: number; cue: Cue; shown: boolean; time_ms: number };
-export type MemoryRef = { id: string; key: string; value: string; source: string; retrieved_ms: number };
+export type MemoryRef = { id: string; text: string; retrieved_ms: number }; // the memory a decision used
 export type DecisionEvent = {
   type: 'decision'; id: string; turn_id: number; mode: Mode; cue: Cue; reason: string;
   facts: { key: string; value: string; turn_id: number; confirmed: boolean }[];
@@ -21,10 +21,25 @@ export type DecisionEvent = {
   latency_ms: { transcript_to_decision: number; decision_to_led?: number };
   time_ms: number;
 };
+// LLM-style memory: one self-contained sentence per note, about one subject, with where it
+// came from. lib/memory.ts retrieves notes for a turn and formats them for the decision API.
+export type MemoryKind = 'preference' | 'constraint' | 'fact' | 'commitment' | 'context';
+export const MEMORY_KINDS: MemoryKind[] = ['constraint', 'preference', 'commitment', 'fact', 'context'];
+export type MemorySource =
+  | { type: 'conversation'; conversation_id: string; turn_ids: number[] } // extracted from what was said
+  | { type: 'user' };                                                   // context the user typed in
 export type MemoryItem = {
-  id: string; key: string; value: string; status: 'confirmed' | 'proposed';
-  source: string; saved_ms: number; last_used_ms?: number; used_by: number;
+  id: string; status: 'confirmed' | 'proposed';
+  kind: MemoryKind;
+  subject: string;    // who it is about: a speaker's name, "Speaker 2", or "user"
+  text: string;       // e.g. "The user's budget is at most $1,200 including delivery."
+  keywords: string[]; // lower-case words retrieval matches on: ["budget", "1200", "delivery"]
+  source: MemorySource; saved_ms: number; last_used_ms?: number;
 };
+
+// A finished turn as kept with its conversation (interim text is never kept).
+export type ConversationTurn = { turn_id: number; speaker: number | null; text: string; time_ms: number };
+export type Conversation = { id: string; started_ms: number; mode: Mode; turns: ConversationTurn[]; extracted_ms?: number };
 export type MemoryEvent = { type: 'memory'; op: 'proposed' | 'confirmed' | 'updated' | 'deleted'; item: MemoryItem };
 export type StatusEvent = { type: 'status'; band: 'connected' | 'reconnecting' | 'off'; mic: 'live' | 'cue-hold' | 'off' };
 export type BridgeEvent = TranscriptEvent | CueEvent | DecisionEvent | MemoryEvent | StatusEvent;
@@ -49,6 +64,8 @@ export type State = {
   turns: Record<number, Turn>;
   decisions: Record<string, Decision>;
   memory: Record<string, MemoryItem>;
+  conversations: Record<string, Conversation>;
+  current: string | null; // conversation that new speech joins; null = the next speech starts one
   status: { band: StatusEvent['band']; mic: StatusEvent['mic'] } | null; // null = never reported
   session: Session;
   latest: number | null; // turn of the newest cue or decision
@@ -61,13 +78,16 @@ export type Action =
   | { type: 'pin'; turn_id: number | null }
   | { type: 'session'; session: Session }
   | { type: 'load'; saved: Partial<Saved> }
-  | { type: 'forget-decisions' };
+  | { type: 'forget-decisions' }
+  | { type: 'new-conversation' }
+  | { type: 'extracted'; id: string; time_ms: number }
+  | { type: 'delete-conversation'; id: string };
 
 // What is kept in this browser's localStorage between visits.
-export type Saved = Pick<State, 'decisions' | 'memory' | 'session'>;
+export type Saved = Pick<State, 'decisions' | 'memory' | 'session' | 'conversations' | 'current'>;
 
 export const initial: State = {
-  turns: {}, decisions: {}, memory: {}, status: null,
+  turns: {}, decisions: {}, memory: {}, conversations: {}, current: null, status: null,
   session: { mode: 'negotiation', goals: [] },
   latest: null, pinned: null, loaded: false,
 };
@@ -87,6 +107,7 @@ const turnOf = (s: State, turn_id: number, time_ms: number): Turn =>
 export function reducer(s: State, a: Action): State {
   switch (a.type) {
     case 'transcript': {
+      if (a.final && a.text) return keep(s, a);
       const prev = s.turns[a.turn_id];
       if (prev?.final && !a.final) return s; // interim never overwrites the final text
       const { type: _, ...t } = a;
@@ -120,18 +141,56 @@ export function reducer(s: State, a: Action): State {
       return { ...s, pinned: a.turn_id };
     case 'session':
       return { ...s, session: a.session };
-    case 'load': // anything that already arrived live wins over the saved copy
+    case 'load': { // anything that already arrived live wins over the saved copy
+      // Notes saved before memory became sentences (key/value) are dropped, not shown broken.
+      const memory = Object.fromEntries(Object.entries(a.saved.memory ?? {}).filter(([, m]) => typeof m?.text === 'string'));
       return {
         ...s, loaded: true,
         decisions: { ...a.saved.decisions, ...s.decisions },
-        memory: { ...a.saved.memory, ...s.memory },
+        memory: { ...memory, ...s.memory },
+        conversations: { ...a.saved.conversations, ...s.conversations },
+        current: s.current ?? a.saved.current ?? null,
         session: a.saved.session ?? s.session,
       };
+    }
     case 'forget-decisions':
       return { ...s, decisions: {}, turns: Object.fromEntries(Object.entries(s.turns).map(([id, { decisionId: _, ...t }]) => [id, t])) };
+    case 'new-conversation':
+      return { ...s, current: null, turns: {}, latest: null, pinned: null };
+    case 'extracted': {
+      const c = s.conversations[a.id];
+      return c ? { ...s, conversations: { ...s.conversations, [a.id]: { ...c, extracted_ms: a.time_ms } } } : s;
+    }
+    case 'delete-conversation': {
+      const { [a.id]: _, ...rest } = s.conversations;
+      return { ...s, conversations: rest, current: s.current === a.id ? null : s.current };
+    }
     default:
       return s;
   }
+}
+
+// A final turn: show it, and keep it in the current conversation. The bridge numbers turns
+// from 1 each time it starts, so a turn number that does not go up means a new run of the
+// bridge: that starts a new conversation (and clears the old run's turns from the screen).
+function keep(s: State, a: TranscriptEvent): State {
+  const conv = s.current ? s.conversations[s.current] : undefined;
+  const last = conv?.turns.at(-1);
+  const restarted = last !== undefined && a.turn_id <= last.turn_id;
+  const c: Conversation = conv && !restarted
+    ? conv
+    : { id: `c${a.time_ms}-${a.turn_id}-${Object.keys(s.conversations).length}`, started_ms: a.time_ms, mode: s.session.mode, turns: [] };
+  const { type: _, ...t } = a;
+  const turns = restarted ? {} : s.turns;
+  return {
+    ...s, current: c.id,
+    turns: { ...turns, [a.turn_id]: { ...turns[a.turn_id], ...t } },
+    conversations: {
+      ...s.conversations,
+      [c.id]: { ...c, turns: [...c.turns, { turn_id: a.turn_id, speaker: a.speaker, text: a.text, time_ms: a.time_ms }] },
+    },
+    ...(restarted ? { latest: null, pinned: null } : {}),
+  };
 }
 
 export function ago(ms: number, now = Date.now()): string {
