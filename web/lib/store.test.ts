@@ -83,21 +83,48 @@ test('empty interim guesses (silence) draw no turn', () => {
   assert.deepEqual(visibleTurns(s).map((t) => t.turn_id), [1]);
 });
 
-test('wave → spoken context is held for confirmation, never joins the conversation, then replaces user memory', () => {
+test('wave toggles continuous verbatim memory without confirmation or replacing existing memory', () => {
   const say = (turn_id: number, text: string, final: boolean, purpose?: 'context'): Action => ({ type: 'transcript', turn_id, speaker: 0, text, final, time_ms: turn_id, purpose });
   const mine = { id: 'old', kind: 'context' as const, subject: 'user', text: 'Budget $1,200.', keywords: [], status: 'confirmed' as const, source: { type: 'user' as const }, saved_ms: 1 };
-  const heard = { ...mine, id: 'heard', source: { type: 'conversation' as const, conversation_id: 'c', turn_ids: [1] } };
   let s = run([
-    { type: 'memory', op: 'confirmed', item: mine }, { type: 'memory', op: 'confirmed', item: heard },
-    say(1, 'hello', true), { type: 'gesture', name: 'wave', time_ms: 2 },
-    say(2, 'budget is now', false, 'context'), say(2, 'Budget is now $1,300', true, 'context'), say(3, 'and white glove delivery', true, 'context'),
+    { type: 'memory', op: 'confirmed', item: mine }, say(1, 'hello', true),
+    { type: 'gesture', name: 'wave', memory: true, time_ms: 20 },
+    say(2, 'budget is now', false, 'context'),
   ]);
-  assert.deepEqual([s.context?.listening, s.context?.text, s.context?.turn_ids], [false, 'Budget is now $1,300 and white glove delivery', [2, 3]]);
+  assert.equal(s.memory['wave-20'], undefined); // guesses are never saved
+  s = run([say(2, 'Budget is now $1,300', true, 'context'), say(3, 'and white glove delivery', true, 'context')], s);
+  assert.deepEqual([s.context?.listening, s.context?.text, s.context?.turn_ids], [true, 'Budget is now $1,300\nand white glove delivery', [2, 3]]);
   assert.deepEqual(visibleTurns(s).map((t) => t.text), ['hello']);
   assert.equal(s.conversations[s.current!].turns.length, 1);
-  s = run([{ type: 'replace-user-memory', items: [{ ...mine, id: 'new', text: 'Budget is now $1,300.' }] }, { type: 'context-done' }], s);
-  assert.deepEqual(Object.keys(s.memory).sort(), ['heard', 'new']); // typed context replaced, heard memory kept
+  assert.equal(s.memory['wave-20'].text, 'Budget is now $1,300\nand white glove delivery');
+  assert.equal(s.memory['wave-20'].status, 'confirmed');
+  assert.equal(s.memory.old, mine);
+  s = run([say(3, 'and white glove delivery', true, 'context'), { type: 'gesture', name: 'wave', memory: true, time_ms: 20 }], s);
+  assert.equal(s.memory['wave-20'].text, 'Budget is now $1,300\nand white glove delivery'); // no duplicate on replay
+  s = run([{ type: 'gesture', name: 'wave', memory: false, time_ms: 30 }, say(4, 'stray context', true, 'context'), say(5, 'conversation resumes', true)], s);
   assert.equal(s.context, null);
+  assert.deepEqual(Object.keys(s.memory).sort(), ['old', 'wave-20']);
+  assert.equal(visibleTurns(s).at(-1)?.text, 'conversation resumes');
+});
+
+test('memory works with decisions off, survives reload, and is separate for each capture', () => {
+  const say = (turn_id: number, text: string): Action => ({ type: 'transcript', turn_id, speaker: null, text, final: true, purpose: 'context', time_ms: turn_id });
+  let s = run([
+    { type: 'mode', decisions: false, conversation: 0, time_ms: 1 },
+    { type: 'gesture', name: 'wave', memory: true, time_ms: 2 }, say(1, '  Exact punctuation: $1,300!  '),
+  ]);
+  s = run([
+    { type: 'load', saved: { memory: s.memory } },
+    { type: 'mode', decisions: false, conversation: 0, time_ms: 1 },
+    { type: 'gesture', name: 'wave', memory: true, time_ms: 2 }, say(2, 'Second sentence.'),
+    { type: 'gesture', name: 'wave', memory: false, time_ms: 3 },
+    { type: 'gesture', name: 'wave', memory: true, time_ms: 4 }, say(3, 'Another capture.'),
+    { type: 'gesture', name: 'wave', memory: false, time_ms: 5 },
+  ]);
+  assert.equal(s.memory['wave-2'].text, '  Exact punctuation: $1,300!  \nSecond sentence.');
+  assert.equal(s.memory['wave-4'].text, 'Another capture.');
+  assert.deepEqual(s.conversations, {});
+  assert.deepEqual(visibleTurns(s), []);
 });
 
 test('triple tap: on opens a new conversation and clears the screen; off closes it; an empty one is dropped', () => {
@@ -109,6 +136,11 @@ test('triple tap: on opens a new conversation and clears the screen; off closes 
   assert.deepEqual(s.conversations[first].turns.map((t) => t.text), ['hello', 'I can do $1,150']);
   s = run([mode(false, 1, 20)], s);
   assert.deepEqual([s.decisionsOn, s.current], [false, null]);
+  assert.deepEqual([visibleTurns(s), selectedTurn(s), s.pinned], [[], null, null]);
+  assert.equal(s.conversations[first].turns.length, 2); // history survives clearing
+  s = run([say(3, 'late speech'), decision('late', 2, 'Ask'), { type: 'cue', turn_id: 2, cue: 'Ask', shown: false, time_ms: 21 }], s);
+  assert.deepEqual(visibleTurns(s), []); // delayed events cannot refill a closed chat
+  assert.equal(s.decisions.late, undefined);
   s = run([mode(true, 2, 30), say(3, 'second talk')], s);
   assert.notEqual(s.current, first);
   assert.deepEqual(visibleTurns(s).map((t) => t.text), ['second talk']);  // screen cleared
@@ -116,4 +148,21 @@ test('triple tap: on opens a new conversation and clears the screen; off closes 
   assert.equal(s.conversations[s.current!].turns.length, 1);
   s = run([mode(false, 2, 40), mode(true, 3, 50), mode(false, 3, 60)], s); // nobody spoke in 3
   assert.equal(Object.keys(s.conversations).length, 2);
+});
+
+
+test('a missed off/on while disconnected opens a new session, while a reload restores the same one', () => {
+  let s = run([
+    { type: 'mode', decisions: true, conversation: 1, time_ms: 1 },
+    { type: 'transcript', turn_id: 1, speaker: 0, text: 'first', final: true, time_ms: 2 },
+  ]);
+  const first = s.current!;
+  const saved = { conversations: s.conversations, current: s.current };
+  const restored = run([{ type: 'load', saved }, { type: 'mode', decisions: true, conversation: 1, time_ms: 1 }]);
+  assert.equal(restored.current, first);
+  assert.equal(visibleTurns(restored)[0].text, 'first');
+  s = reducer(s, { type: 'mode', decisions: true, conversation: 2, time_ms: 3 });
+  assert.notEqual(s.current, first);
+  assert.deepEqual(visibleTurns(s), []);
+  assert.equal(s.conversations[first].turns[0].text, 'first');
 });

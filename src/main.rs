@@ -1,7 +1,7 @@
 //! Bridge demo: prints every transcript with its turn and bridge latency. The UI gets the
 //! same stream at http://127.0.0.1:8787/events. The orchestrator calls the same
 //! `next_transcript` / `show` / `publish`.
-//!   cargo run -- --band <team band number>         live listening, no taps
+//!   cargo run -- --band <team band number>         triple tap to listen
 //!   cargo run -- --typed                           TYPED input, no band
 //!   add --cue to answer every final turn with an Ask cue (tests the LED path)
 use decision_maker::bridge::{Bridge, Cue, Purpose};

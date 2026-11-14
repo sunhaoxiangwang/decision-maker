@@ -1,5 +1,7 @@
 """Turn logic without a band or Deepgram:  .venv/bin/python3 pipeline/test_band_pipeline.py"""
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -44,31 +46,44 @@ assert not swing(1500, -300)                # quiet for 1.5 s after a wave
 w2 = bp.WaveDetector(dps=150, swings=5, window_ms=3000)
 assert not any(w2.feed(t, r) for t, r in [(0, 300), (2000, -300), (4000, 300), (6000, -300), (8000, 300)])  # too slow overall
 
-# A wave makes the next final turn context, then conversation again.
-sent = []
+# Both modes start off. Waves toggle continuous capture, including with decisions off.
+sent, modes, memory_modes = [], [], []
 bp.emit = lambda text, speaker, final, purpose: sent.append((text, final, purpose))
-bp.publish = lambda js: sent.append(("event", js))
-modes = []
 bp.set_mode = modes.append
+bp.set_memory_mode = memory_modes.append
 bp.ears = None
-bp._emit("not in decisions mode", True)     # off: dropped
+bp._emit("off", True)
 assert sent == []
-bp.toggle_decisions()                       # triple tap: on (no band in this test)
-assert bp.decisions_on and modes == [True]
-bp._emit("before", True)
 bp.on_wave()
-bp._emit("my budget is now", False)
-bp._emit("my budget is now 1300", True)
-bp._emit("ok so", True)
-assert [s[2] for s in sent if s[0] != "event"] == ["conversation", "context", "context", "conversation"], sent
-assert any(s[0] == "event" and '"wave"' in s[1] for s in sent)
-bp.toggle_decisions()                       # triple tap again: off
-assert not bp.decisions_on and modes == [True, False]
+assert bp.memory_on and not bp.decisions_on
+bp._emit("Budget is now $1,300.", True)
+bp._emit("And delivery", False)
+bp._emit("And delivery must be included.", True)
+assert all(s[2] == "context" for s in sent)
+bp.on_wave()
+assert not bp.memory_on and memory_modes == [True, False]
 n = len(sent)
+bp._emit("after memory off", True)
+assert len(sent) == n
+bp.toggle_decisions()
+assert bp.decisions_on and modes == [True]
+bp._emit("conversation", True)
+assert sent[-1][2] == "conversation"
 bp.on_wave()
-bp._emit("after off", True)
-assert len(sent) == n                       # off: no wave, no turns
-print("wave ok")
+assert not bp.set_cue("#00ff00", "solid")
+bp._emit("context one", True)
+bp._emit("context two", True)
+assert [s[2] for s in sent[-2:]] == ["context", "context"]
+bp.on_wave()
+bp._emit("conversation again", True)
+assert sent[-1][2] == "conversation"
+assert bp.set_cue("#00ff00", "solid")
+bp.on_wave()
+bp.toggle_decisions()  # stopping decisions also stops active memory capture
+assert not bp.decisions_on and not bp.memory_on
+assert modes == [True, False]
+assert not bp.set_cue("#00ff00", "solid")
+print("memory toggle ok")
 
 # ---- triple tap ---------------------------------------------------------------------------
 t = bp.TapCounter(taps=3, window_ms=1200)
@@ -76,3 +91,140 @@ assert not t.feed(0) and not t.feed(300) and t.feed(600)       # tap tap tap
 assert not t.feed(5000) and t.feed(5300, count=2)               # tap + double-tap
 assert not t.feed(9000) and not t.feed(9800) and not t.feed(11000)  # too slow
 print("triple tap ok")
+
+
+# Exercise the actual registered tap/motion handlers, mic/LED ordering, and final drain.
+class FakeBand:
+    def __init__(self):
+        self.handlers, self.calls = {}, []
+        self.audio = False
+
+    def on(self, event, callback):
+        self.handlers[event] = callback
+
+    def configure(self, **options):
+        self.calls.append(("configure", options))
+        self.audio = options.get("audio", self.audio)
+
+    def set_events(self, **options):
+        self.calls.append(("events", options))
+
+    def set_led(self, colour, **options):
+        assert not self.audio, "LED commands require mic off"
+        self.calls.append(("led", colour, options))
+
+    def led_off(self):
+        assert not self.audio
+        self.calls.append(("off",))
+
+
+class FakeEars:
+    speaker = 0
+
+    def __init__(self):
+        self.pending = ""
+
+    def start(self, callback):
+        self.callback = callback
+
+    def stop(self):
+        if self.pending:
+            self.callback(self.pending, True)
+        self.pending = ""
+
+    def _sentence_ends(self):
+        self.stop()
+
+
+class FakeTimer:
+    def __init__(self, seconds, callback):
+        self.seconds, self.callback = seconds, callback
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        pass  # deliberately allow stale callbacks to run: production must reject them
+
+
+class ImmediateThread:
+    def __init__(self, target, **options):
+        self.target = target
+
+    def start(self):
+        self.target()
+
+
+bp.band = fake = FakeBand()
+sent.clear()
+modes.clear()
+memory_modes.clear()
+with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer", FakeTimer), patch.object(bp.threading, "Thread", ImmediateThread):
+    bp._watch_gestures()
+    assert not fake.audio
+    assert modes == []  # subscribing does not activate decisions
+    tap = lambda kind: fake.handlers[kind](SimpleNamespace(kind=kind))
+    with patch.object(bp, "_now_ms", side_effect=[0, 300, 600, 2000, 2300]):
+        tap("tap")
+        tap("tap")
+        assert not bp.decisions_on
+        tap("tap")
+        assert bp.decisions_on and modes == [True]
+        assert ("led", "#00ff00", {"pattern": "blink", "period": 400}) in fake.calls
+        green_timer = bp._resume
+        assert green_timer.seconds == 2.0  # five 400-ms blinks
+        assert not fake.audio
+        green_timer.callback()
+        assert fake.audio
+
+        bp.ears.pending = "last conversation words"
+        def wave(start):
+            for i, rate in enumerate([300, -300, 300, -300, 300]):
+                fake.handlers["motion"](SimpleNamespace(t=start + i * 200, gz=rate))
+
+        wave(0)
+        assert bp.memory_on and memory_modes == [True]
+        assert sent[-1] == ("last conversation words", True, "conversation")
+        bp._resume.callback()
+        assert fake.audio
+        bp._emit("memory first", True)
+        bp.ears.pending = "memory last words"
+        wave(3000)
+        assert not bp.memory_on and memory_modes == [True, False]
+        assert sent[-1] == ("memory last words", True, "context")
+        bp._resume.callback()
+        assert fake.audio  # decisions resume after memory stops
+        bp.ears.pending = "last words before off"
+        tap("tap")
+        assert bp.decisions_on
+        tap("double-tap")  # one plus two taps also toggles
+        assert not bp.decisions_on and modes == [True, False]
+        assert sent[-1] == ("last words before off", True, "conversation")
+        assert ("led", "#ff0000", {"pattern": "blink", "period": 400}) in fake.calls
+        assert bp._resume.seconds == 2.0
+        green_timer.callback()  # old timer must not turn the mic back on
+        assert not fake.audio
+        bp._resume.callback()
+        assert fake.calls[-1] == ("off",)
+
+    wave(6000)  # memory starts even with decisions off
+    assert bp.memory_on and not bp.decisions_on
+    bp._resume.callback()
+    assert fake.audio
+    bp.ears.pending = "standalone memory"
+    wave(9000)
+    assert not bp.memory_on and not bp.decisions_on
+    assert sent[-1] == ("standalone memory", True, "context")
+    bp._resume.callback()
+    assert not fake.audio and fake.calls[-1] == ("off",)
+
+    def fail_start(self, callback):
+        raise speech.SpeechError("test connection failure")
+
+    with patch.object(FakeEars, "start", fail_start):
+        bp.toggle_decisions()
+        assert not bp.decisions_on and bp.ears is None
+        bp.on_wave()
+        assert not bp.memory_on and bp.ears is None
+
+print("registered gestures, LEDs, drain and failures ok")

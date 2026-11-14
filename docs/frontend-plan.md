@@ -115,7 +115,8 @@ type MemoryRef = { id: string; text: string; retrieved_ms: number };  // see doc
 type MemoryEvent = { type: 'memory'; op: 'proposed' | 'confirmed' | 'updated' | 'deleted'; item: MemoryItem };
 // Built: triple tap on the band switches decisions mode; replayed to every UI that connects.
 type ModeEvent = { type: 'mode'; decisions: boolean; conversation: number; time_ms: number };
-type GestureEvent = { type: 'gesture'; name: 'wave'; time_ms: number };
+// Built: wave starts/stops continuous verbatim memory capture; replayed on connect.
+type GestureEvent = { type: 'gesture'; name: 'wave'; memory: boolean; time_ms: number };
 type StatusEvent = { type: 'status'; band: 'connected' | 'reconnecting' | 'off'; mic: 'live' | 'cue-hold' | 'off' };
 
 // Proposed: HTTP JSON

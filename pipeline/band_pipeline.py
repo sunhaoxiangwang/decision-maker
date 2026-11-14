@@ -1,24 +1,22 @@
 """Python half of the bridge. Runs inside the Rust process (src/bridge.rs).
 
-Rust sets `emit(text, speaker, is_final, purpose)`, `publish(json)` and `set_mode(on)` on
+Rust sets `emit(text, speaker, is_final, purpose)`, `set_memory_mode(on)` and `set_mode(on)` on
 this module, then calls run() on its own thread and set_cue() whenever the backend has a
 decision. Only this process connects to the band (one Bluetooth connection, AGENTS.md rule 7).
 Gestures are detected here, where the band's events arrive; only the result crosses to Rust.
 
 Decisions mode (triple tap toggles it; off at start):
-  on:  green blinks 5 times, then a fresh Deepgram connection (speaker numbers start again)
-       and the mic: every turn is sent, saved and decided on as one conversation.
+  on:  a fresh Deepgram connection (speaker numbers start again), green blinks 5 times,
+       then the mic: conversation turns are sent and saved for decisions.
   off: red blinks 5 times, the mic stops (nothing is heard, sent or saved), the light goes off.
 
 Turns end on Deepgram's UtteranceEnd: a gap after the last recognised *word*, worked out from
 the transcript's word timings, so background noise cannot hold a turn open the way it holds
 open the audio silence detector (speech_final, ignored here).
 
-Wave (decisions mode only): the band flashes white (speak now), and the next turn is the
-user's updated context (purpose "context"); the UI asks to confirm it before it replaces
-their active memory.
+Wave toggles memory capture, even with decisions off. All turns until the next wave are
+context, never decisions. The UI saves each finished turn as given, until capture stops.
 """
-import json
 import os
 import sys
 import threading
@@ -52,7 +50,7 @@ WAVE_ACK_S = 0.8         # white flash that says "speak now" (the mic is off whi
 band = None
 ears = None
 decisions_on = False
-_context_next = False    # the next turn is spoken context, after a wave
+memory_on = False
 _resume = None
 _mode_lock = threading.Lock()
 
@@ -128,57 +126,89 @@ def _now_ms():
 
 
 def _emit(text, final):
-    global _context_next
-    if not decisions_on:
+    if not decisions_on and not memory_on:
         return                 # off: nothing is sent or saved
-    purpose = "context" if _context_next else "conversation"
-    if final and _context_next:
-        _context_next = False
+    purpose = "context" if memory_on else "conversation"
     emit(text, ears.speaker if ears else None, final, purpose)  # noqa: F821  (set by Rust)
+
+
+def _start_listening():
+    global ears
+    if band:
+        try:
+            fresh = Diarized()
+            fresh.start(_emit)
+            ears = fresh
+        except speech.SpeechError as e:
+            print("Listening stays off:", e)
+            return False
+    return True
+
+
+def _stop_listening():
+    """Drain the old connection before changing the transcript's purpose or mode."""
+    global ears, _resume
+    if _resume:
+        _resume.cancel()
+        _resume = None
+    if band:
+        band.configure(audio=False, mic_level=False)
+    if ears:
+        try:
+            ears.stop()
+        except speech.SpeechError as e:
+            print("Listening stopped:", e)
+        finally:
+            ears = None
 
 
 def toggle_decisions():
     """Triple tap: decisions mode on or off. Hands the new mode to Rust (set_mode)."""
-    global decisions_on, ears, _context_next
+    global decisions_on, memory_on
     with _mode_lock:
+        _stop_listening()
+        if memory_on:
+            memory_on = False
+            set_memory_mode(False)  # noqa: F821  (Rust: save the captured transcript)
         if not decisions_on:
-            if band:
-                try:
-                    fresh = Diarized()
-                    fresh.start(_emit)   # a new connection: speaker numbers start again
-                except speech.SpeechError as e:
-                    print("Decisions mode stays off:", e)
+            if not _start_listening():
+                if band:
                     _flash("#ff0000", "blink", MODE_BLINKS * BLINK_PERIOD_MS / 1000, then=band.led_off)
-                    return
-                ears = fresh
+                return
             decisions_on = True
             set_mode(True)  # noqa: F821  (Rust: new conversation, UI opens it)
             print("Decisions mode ON: listening.")
             _blink("#00ff00", then=_mic_on)
         else:
-            _context_next = False
+            decisions_on = False
+            set_mode(False)  # noqa: F821  (drained turns arrived before this event)
             print("Decisions mode OFF: not listening.")
-            if band:
-                band.configure(audio=False, mic_level=False)  # nothing new is heard from here
             _blink("#ff0000", then=band.led_off if band else None)
-            if ears:
-                ears.stop()            # words already spoken are still sent, before the mode ends
-            decisions_on, ears = False, None
-            set_mode(False)  # noqa: F821
 
 
 def on_wave():
-    """Wave seen: words so far finish the conversation turn, then the next turn is context."""
-    global _context_next
-    if not decisions_on:
-        return
-    if ears:
-        ears._sentence_ends()
-    _context_next = True
-    publish(json.dumps({"type": "gesture", "name": "wave", "time_ms": _now_ms()}))  # noqa: F821
-    print("Wave: say the updated context now.")
-    if band:
-        _flash("#ffffff", "solid", WAVE_ACK_S, then=_mic_on)
+    """Wave starts/stops continuous memory capture; drain before each boundary."""
+    global memory_on, decisions_on
+    with _mode_lock:
+        _stop_listening()
+        if memory_on:
+            memory_on = False
+            set_memory_mode(False)  # noqa: F821
+            print("Memory capture OFF: transcript saved.")
+            if decisions_on and not _start_listening():
+                decisions_on = False
+                set_mode(False)  # noqa: F821
+        elif _start_listening():
+            memory_on = True
+            set_memory_mode(True)  # noqa: F821
+            print("Memory capture ON: wave again to save and stop.")
+        else:
+            if decisions_on:
+                decisions_on = False
+                set_mode(False)  # noqa: F821
+        if band:
+            _flash("#ffffff", "solid", WAVE_ACK_S,
+                   then=_mic_on if decisions_on or memory_on else band.led_off)
 
 
 def run(band_number):
@@ -192,15 +222,22 @@ def run(band_number):
             elif line == "/wave":
                 on_wave()
             elif line:
-                if not decisions_on:
-                    print("(decisions mode is off: type /triple first)")
+                if not decisions_on and not memory_on:
+                    print("(listening is off: type /triple or /wave first)")
                 _emit(line, True)
         return
 
     from vexo_open.sync import Band
 
     band = Band.connect(band_number, auto_reconnect=True)
-    debug = bool(os.environ.get("VEXO_GESTURE_DEBUG"))
+    _watch_gestures(bool(os.environ.get("VEXO_GESTURE_DEBUG")))
+    print("Connected to %s. Triple-tap the band to start decisions mode." % band.name)
+    while True:
+        band.wait(1)
+
+
+def _watch_gestures(debug=False):
+    """Register the real event handlers separately so they can be tested without Bluetooth."""
     taps, wave = TapCounter(), WaveDetector()
     peaks = {"gx": 0, "gy": 0, "gz": 0, "t": 0}
 
@@ -217,7 +254,7 @@ def run(band_number):
             if m.t - peaks["t"] > 1000:
                 print("gesture debug: peak deg/s  gx %(gx)4.0f  gy %(gy)4.0f  gz %(gz)4.0f" % peaks)
                 peaks.update(gx=0, gy=0, gz=0, t=m.t)
-        if decisions_on and wave.feed(m.t, getattr(m, WAVE_AXIS)):
+        if wave.feed(m.t, getattr(m, WAVE_AXIS)):
             threading.Thread(target=on_wave, daemon=True).start()
 
     band.on("audio", lambda a: ears and ears.feed(a))
@@ -225,14 +262,11 @@ def run(band_number):
     band.on("double-tap", lambda e: on_tap(e, DOUBLE_TAP_COUNTS))
     band.on("motion", on_motion)
     band.set_events(kinds=["tap", "double-tap"], tap_threshold=TAP_THRESHOLD_G)
-    band.configure(events=True, motion=50)  # mic stays off until decisions mode is on
-    print("Connected to %s. Triple-tap the band to start decisions mode." % band.name)
-    while True:
-        band.wait(1)
+    band.configure(events=True, motion=50)  # mic stays off until a triple tap or wave
 
 
 def _mic_on():
-    if band and decisions_on:
+    if band and (decisions_on or memory_on):
         band.configure(audio=True)  # solid blue: the microphone is on
 
 
@@ -245,14 +279,20 @@ def _blink(hex_colour, then):
 
 def set_cue(hex_colour, pattern):
     """Mic off (the band refuses LED commands otherwise), light for CUE_HOLD_S, mic back on."""
-    if band is None:
-        print("TYPED cue (no band):", hex_colour or "off", pattern)
-        return
-    if not decisions_on or _mode_lock.locked():
-        return                 # off, or switching: the mode's blinks win
-    if ears:
-        ears._sentence_ends()  # words heard so far become a turn; with no sound, no UtteranceEnd would come
-    _flash(hex_colour, pattern, CUE_HOLD_S, then=_mic_on)
+    if not _mode_lock.acquire(blocking=False):
+        return False
+    try:
+        if not decisions_on or memory_on:
+            return False
+        if band is None:
+            print("TYPED cue (no band):", hex_colour or "off", pattern)
+        else:
+            if ears:
+                ears._sentence_ends()
+            _flash(hex_colour, pattern, CUE_HOLD_S, then=_mic_on)
+        return True
+    finally:
+        _mode_lock.release()
 
 
 def _flash(hex_colour, pattern, seconds, then):
@@ -265,6 +305,12 @@ def _flash(hex_colour, pattern, seconds, then):
         band.set_led(hex_colour, pattern=pattern, period=BLINK_PERIOD_MS if pattern == "blink" else 600)
     else:
         band.led_off()
-    _resume = threading.Timer(seconds, then)
+    def finish():
+        with _mode_lock:
+            if _resume is timer and then:
+                then()
+
+    timer = threading.Timer(seconds, finish)
+    _resume = timer
     _resume.daemon = True
     _resume.start()

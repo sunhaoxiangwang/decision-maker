@@ -60,7 +60,7 @@ export default function MemoryPage() {
   return (
     <section className="page">
       <h1>Memory</h1>
-      <p className="muted">What the decision agent may rely on, written as sentences. Stored in this browser and sent to the orchestrator.</p>
+      <p className="muted">Stored in this browser and sent to the orchestrator. Wave to start recording memory; wave again to stop. Spoken memory is saved as the transcript, without summarizing.</p>
 
       <form className="context" onSubmit={(e) => { e.preventDefault(); addContext(e.currentTarget); }}>
         <textarea

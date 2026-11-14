@@ -1,25 +1,26 @@
 # Memory: how it's built, stored and fed to decisions
 
-Memory is written as notes in plain sentences, the way an LLM would write them. Each note is
-one self-contained sentence about one subject, with where it came from. It is kept in the
-companion UI (the browser's localStorage) and sent to the orchestrator whenever it changes.
+Memory holds verbatim wave transcripts and extracted sentence notes, with where each came
+from. It is kept in the companion UI (the browser's localStorage) and sent to the proposed
+orchestrator endpoint whenever it changes.
 
 ## Where notes come from
 
 | Source | How | Status |
 |---|---|---|
+| **Speech between waves** | Saved as one confirmed context item per capture, with each final transcript turn on its own line. No model call or confirmation. | `confirmed`: the user recorded it |
 | **Context the user types** (Memory tab, "Remember") | Sent to `POST /llm/memory` with `{source:"user", text}`. OpenAI splits it into notes. With no OpenAI key, each line is saved as it was typed. | `confirmed`: the user said it |
 | **Past conversations** (Memory tab → Past conversations → "Remember this conversation") | The saved transcript is sent as lines (`t3 Seller: I can do $1,150`) to `POST /llm/memory` with `{source:"conversation", conversation_id, transcript}` | `proposed`: never used until the user confirms it |
 
-Conversations are saved only while **decisions mode** is on:
+Conversation history is saved while **decisions mode** is on; wave capture is stored separately as memory:
 - **Triple-tap** the band (3 taps within 1.2 s; a `double-tap` counts as 2).
-  - The band blinks green 5 times. Then a fresh Deepgram connection opens, so speaker numbers start again, and the mic turns on.
+  - The band blinks green 5 times. A fresh Deepgram connection opens, so speaker numbers start again; the mic turns on after the blinks.
   - Rust gets the handoff (`set_mode(true)`) and every UI receives `{"type":"mode","decisions":true,"conversation":N}`. The UI opens a new conversation and clears the screen.
   - Every finished turn carries `conversation: N`.
 - **Triple-tap again**: the band blinks red 5 times and the mic stops.
   - Words already spoken are still sent.
-  - After that, nothing is heard, sent or saved, and `Bridge::show` sends no cues to the band.
-  - The UI closes the conversation, and drops it if nobody spoke.
+  - After that, `Bridge::show` sends no cues to the band. The mic stays off unless a wave starts memory capture.
+  - The UI closes the conversation, clears the live chat and selected decision, and drops the conversation if nobody spoke. Finished turns remain in Memory → Past conversations.
 - The bridge starts with the mode **off**. A UI that connects later receives the current mode straight away.
 - **New conversation** on the Live tab, or a bridge restart, also starts a new conversation.
 - Detection happens in Python (`TapCounter` in `pipeline/band_pipeline.py`).
@@ -47,7 +48,7 @@ Conversations are saved only while **decisions mode** is on:
 ```
 - `kind`: `constraint` (hard limits, required terms), `preference`, `commitment` (what someone agreed to, with exact terms), `fact`, or `context`.
 - `subject`: the speaker's name as set on the Live tab, `Speaker N`, or `user`.
-  - Deepgram speaker numbers are only stable within one run of the bridge.
+  - Deepgram speaker numbers are only stable within one speech connection; mode and wave boundaries open fresh connections.
   - Name the speakers before pressing "Remember", so notes are about "Seller" rather than "Speaker 2".
 
 ## Retrieval (`web/lib/memory.ts`)
@@ -83,21 +84,34 @@ Conversations are saved only while **decisions mode** is on:
 - The orchestrator keeps that list and runs the same retrieval for each final turn it gets from `Bridge::next_transcript`. The keyword fields are there so this takes a few lines of Rust.
 - Until the orchestrator exists, the request fails quietly.
 
-## Updating context by gesture: wave → speak → confirm
+## Updating memory by gesture: wave → speak → wave
 
-Waving only works while decisions mode is on.
+Waving toggles continuous memory capture, including while decisions mode is off.
 
-1. **Wave** the band left to right three times. In practice that's five fast swings of alternating direction within 3 s on one gyro axis, detected in Python (`WaveDetector` in `pipeline/band_pipeline.py`).
-2. The band **flashes white** for 0.8 s. The mic is off while the light shows, then listening resumes. The UI shows "say the updated context now".
-3. **Speak.** The next finished turn is tagged `"purpose":"context"` on the transcript event, and `Transcript.purpose == Purpose::Context` in Rust.
-   - The orchestrator must not decide on a context turn.
-   - The UI keeps it out of the conversation.
-   - If a pause splits the update, the next part is *not* captured: every turn after the first is conversation again. Edit it into the text before confirming.
-4. **Confirm** on the Live tab, where the text can be edited first. The text goes through the same note-writing as typed context.
-5. The new notes **replace** your own context, meaning the confirmed notes whose source is `user`. Notes from conversations are kept.
-6. Memory is sent to the orchestrator automatically. Retrieval always includes your own context notes, so every decision from the next turn on uses the new context.
+1. Wave the band left to right three times: five fast alternating gyro swings within 3 s, detected by `WaveDetector` in `pipeline/band_pipeline.py`.
+2. Rust receives `set_memory_mode(true)` and broadcasts `{"type":"gesture","name":"wave","memory":true,"time_ms":...}`. The band flashes white for 0.8 s with the mic off, then listens (blue).
+3. Every spoken turn until the next wave is `purpose:"context"` / Rust `Purpose::Context`. Pauses do not stop capture. Decision cues are suspended during capture; context never joins conversation history.
+4. Each final turn is saved exactly as received, separated by a newline, in one confirmed memory item for this capture. No extraction, model call, editing step or confirmation is required. Existing memory is kept. Saving each finished turn also preserves it across a browser reload.
+5. Wave again. The mic stops and the speech connection drains before Rust receives `set_memory_mode(false)`. The UI closes the capture indicator. If decisions mode was on, conversation listening resumes; otherwise the mic and LED turn off after the white flash.
+6. Triple-tapping also stops and saves any active memory capture before switching decisions mode. A new speech connection at each boundary prevents conversation and memory words from mixing.
 
-Calibrating on the band:
-- Start with `VEXO_GESTURE_DEBUG=1` set in the environment and wave. Once a second it prints the fastest turning rate on each axis.
-- Set `WAVE_AXIS` to the axis that moves most when you wave, and `WAVE_DPS` to about half its peak.
-- In typed mode, a line `/wave` acts out the gesture.
+Mode and memory state are replayed to a UI connecting later. Transcript events have no server backlog: the UI must be connected during recording to save new speech. Memory and conversation history are kept in that browser's localStorage. The proposed orchestrator memory endpoint is still not implemented.
+
+Calibration on the real band remains necessary:
+- `VEXO_GESTURE_DEBUG=1` prints tap events and peak turning rate on each gyro axis.
+- Adjust `WAVE_AXIS`, `WAVE_DPS`, and tap sensitivity from actual measurements.
+- In typed mode, `/wave` runs the same toggle callback and `/triple` toggles decisions.
+
+## Verification
+
+From the project root:
+
+```sh
+PYO3_PYTHON="$PWD/.venv/bin/python3" cargo test
+PYO3_PYTHON="$PWD/.venv/bin/python3" cargo build
+.venv/bin/python3 pipeline/test_band_pipeline.py
+.venv/bin/python3 pipeline/test_bridge.py
+(cd web && npm test && npx tsc --noEmit && npm run build)
+```
+
+`test_band_pipeline.py` exercises the actual registered gesture handlers with fake hardware, checks LED/mic ordering and five-blink timing, drains the last words at mode boundaries, and verifies failures stay off. `test_bridge.py` runs the actual embedded Python/Rust process in typed mode, reads SSE, and folds those events through the frontend reducer to check memory, conversation history, clearing, and reload. These checks do not replace physically tapping/waving and observing the LED.

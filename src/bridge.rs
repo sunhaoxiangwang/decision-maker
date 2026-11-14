@@ -29,8 +29,7 @@ pub struct Transcript {
     pub speaker: Option<u32>,
     pub text: String,
     pub is_final: bool,
-    /// Context = the user's spoken update after the wave gesture: confirm it in the UI and
-    /// use it as memory; do not decide on it.
+    /// Context = speech captured between waves, saved verbatim as memory; never decide on it.
     pub purpose: Purpose,
     /// When the bridge received it from Python (for latency measurement).
     pub received: Instant,
@@ -99,7 +98,11 @@ impl Turns {
 /// Server-Sent Events for the UI: `new EventSource("http://127.0.0.1:8787/events")`.
 /// Every event is one JSON object with a "type" field.
 #[derive(Default)]
-struct Hub(Mutex<Vec<TcpStream>>, Mutex<Option<String>>); // clients; the last `mode` event
+struct Hub {
+    clients: Mutex<Vec<TcpStream>>,
+    mode: Mutex<Option<String>>,
+    memory: Mutex<Option<String>>,
+}
 
 impl Hub {
     /// Transcripts are private conversation: only `ui_origin` (the Next.js app) may read them
@@ -121,9 +124,10 @@ impl Hub {
                 );
                 if stream.write_all(head.as_bytes()).is_ok() {
                     // A UI that connects late learns the current mode at once.
-                    let mode = self.1.lock().unwrap().clone();
-                    if mode.map_or(true, |m| stream.write_all(format!("data: {m}\n\n").as_bytes()).is_ok()) {
-                        self.0.lock().unwrap().push(stream);
+                    let mut clients = self.clients.lock().unwrap();
+                    let snapshots = [self.mode.lock().unwrap().clone(), self.memory.lock().unwrap().clone()];
+                    if snapshots.into_iter().flatten().all(|m| stream.write_all(format!("data: {m}\n\n").as_bytes()).is_ok()) {
+                        clients.push(stream);
                     }
                 }
             }
@@ -133,7 +137,7 @@ impl Hub {
 
     fn send(&self, json: &str) {
         let frame = format!("data: {json}\n\n");
-        self.0.lock().unwrap().retain_mut(|s| s.write_all(frame.as_bytes()).is_ok());
+        self.clients.lock().unwrap().retain_mut(|s| s.write_all(frame.as_bytes()).is_ok());
     }
 }
 
@@ -187,6 +191,8 @@ fn transcript_json(t: &Transcript) -> String {
 
 pub struct Bridge {
     decisions: Arc<AtomicBool>,
+    memory: Arc<AtomicBool>,
+    decision_turn: Arc<AtomicU64>,
     rx: Receiver<Transcript>,
     turns: Arc<Turns>,
     hub: Arc<Hub>,
@@ -201,12 +207,19 @@ impl Bridge {
         let port = std::env::var("BRIDGE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8787);
         let ui_origin = std::env::var("BRIDGE_UI_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".into());
         let hub = Arc::new(Hub::default());
+        *hub.mode.lock().unwrap() = Some(format!(r#"{{"type":"mode","decisions":false,"conversation":0,"time_ms":{}}}"#, now_ms()));
+        *hub.memory.lock().unwrap() = Some(format!(r#"{{"type":"gesture","name":"wave","memory":false,"time_ms":{}}}"#, now_ms()));
         hub.clone().serve(port, ui_origin).map_err(|e| format!("UI events port {port}: {e}"))?;
 
         let (tx, rx) = channel();
         let turns = Arc::new(Turns::default());
         let (emit_turns, emit_hub, publish_hub, mode_hub) = (turns.clone(), hub.clone(), hub.clone(), hub.clone());
         let decisions = Arc::new(AtomicBool::new(false)); // off until the user triple-taps
+        let memory = Arc::new(AtomicBool::new(false));
+        let decision_turn = Arc::new(AtomicU64::new(0));
+        let (emit_on, emit_memory, emit_decision_turn) = (decisions.clone(), memory.clone(), decision_turn.clone());
+        let (memory_on, memory_hub, memory_turn) = (memory.clone(), hub.clone(), decision_turn.clone());
+        let mode_turn = decision_turn.clone();
         let conversation = Arc::new(AtomicU64::new(0));
         let (mode_on, mode_conv, emit_conv) = (decisions.clone(), conversation.clone(), conversation.clone());
         let pipeline = Python::with_gil(|py| -> PyResult<Py<PyModule>> {
@@ -226,22 +239,30 @@ impl Bridge {
                         } else {
                             args.extract()?
                         };
+                    let purpose = Purpose::from_py(purpose.as_deref());
+                    if (purpose == Purpose::Conversation && (!emit_on.load(SeqCst) || emit_memory.load(SeqCst)))
+                        || (purpose == Purpose::Context && !emit_memory.load(SeqCst)) {
+                        return Ok(());
+                    }
                     let t = Transcript {
                         turn_id: emit_turns.assign(is_final),
                         conversation: emit_conv.load(SeqCst),
                         speaker,
                         text,
                         is_final,
-                        purpose: Purpose::from_py(purpose.as_deref()),
+                        purpose,
                         received: Instant::now(),
                     };
+                    if is_final && purpose == Purpose::Conversation {
+                        emit_decision_turn.store(t.turn_id, SeqCst);
+                    }
                     emit_hub.send(&transcript_json(&t));
                     let _ = tx.send(t);
                     Ok(())
                 },
             )?;
             m.setattr("emit", emit)?;
-            // Python's own UI events (the wave gesture): JSON it built with json.dumps.
+            // Additional Python UI events, encoded as JSON.
             let publish = PyCFunction::new_closure_bound(
                 py,
                 None,
@@ -263,12 +284,26 @@ impl Bridge {
                     let n = if on { mode_conv.fetch_add(1, SeqCst) + 1 } else { mode_conv.load(SeqCst) };
                     mode_on.store(on, SeqCst);
                     let json = format!(r#"{{"type":"mode","decisions":{on},"conversation":{n},"time_ms":{}}}"#, now_ms());
-                    *mode_hub.1.lock().unwrap() = Some(json.clone());
+                    mode_turn.store(0, SeqCst); // no cues from a previous conversation
+                    *mode_hub.mode.lock().unwrap() = Some(json.clone());
                     mode_hub.send(&json);
                     Ok(())
                 },
             )?;
             m.setattr("set_mode", set_mode)?;
+            let set_memory_mode = PyCFunction::new_closure_bound(
+                py, None, None,
+                move |args: &Bound<'_, PyTuple>, _kw: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
+                    let (on,): (bool,) = args.extract()?;
+                    memory_on.store(on, SeqCst);
+                    memory_turn.store(0, SeqCst);
+                    let json = format!(r#"{{"type":"gesture","name":"wave","memory":{on},"time_ms":{}}}"#, now_ms());
+                    *memory_hub.memory.lock().unwrap() = Some(json.clone());
+                    memory_hub.send(&json);
+                    Ok(())
+                },
+            )?;
+            m.setattr("set_memory_mode", set_memory_mode)?;
             Ok(m.unbind())
         })
         .map_err(|e| e.to_string())?;
@@ -283,7 +318,7 @@ impl Bridge {
                 let _ = m.delattr("emit"); // drops the sender: next_transcript() returns None
             })
         });
-        Ok(Bridge { decisions, rx, turns, hub, pipeline })
+        Ok(Bridge { decisions, memory, decision_turn, rx, turns, hub, pipeline })
     }
 
     /// Blocks for the next transcript (interim and final), passed on as the pipeline
@@ -292,39 +327,37 @@ impl Bridge {
         self.rx.recv().ok()
     }
 
-    /// Shows `cue` on the band for `turn_id`. Ok(false) = stale turn or decisions mode off, dropped without
-    /// touching the band. The mic pauses while the light shows, then resumes by itself.
+    /// Shows `cue` for the latest conversation final. Off, memory capture, stale turns and
+    /// mode transitions return Ok(false). The mic pauses for the light, then resumes.
     pub fn show(&self, turn_id: u64, cue: Cue) -> Result<bool, String> {
-        let shown = self.decisions_on() && self.turns.is_latest(turn_id);
+        let shown = Python::with_gil(|py| -> Result<bool, String> {
+            if turn_id == 0 || !self.decisions_on() || self.memory_on() || !self.turns.is_latest(turn_id)
+                || self.decision_turn.load(SeqCst) != turn_id {
+                return Ok(false);
+            }
+            let (hex, pattern) = cue.led().map_or((None, "solid"), |(h, p)| (Some(h), p));
+            self.pipeline.bind(py).call_method1("set_cue", (hex, pattern))
+                .and_then(|result| result.extract::<bool>()).map_err(|e| e.to_string())
+        })?;
         self.hub.send(&format!(
             r#"{{"type":"cue","turn_id":{turn_id},"cue":{},"shown":{shown},"time_ms":{}}}"#,
             json_str(&format!("{cue:?}")),
             now_ms()
         ));
-        if !shown {
-            return Ok(false);
-        }
-        let (hex, pattern) = match cue.led() {
-            Some((hex, pattern)) => (Some(hex), pattern),
-            None => (None, "solid"),
-        };
-        Python::with_gil(|py| {
-            self.pipeline
-                .bind(py)
-                .call_method1("set_cue", (hex, pattern))
-                .map(|_| true)
-                .map_err(|e| e.to_string())
-        })
+        Ok(shown)
     }
 
-    /// Sends any JSON object of the orchestrator's (decision reasons, memory updates) to the
-    /// UI on the same event stream. Give it a "type" field.
-    /// True while the user has decisions mode on (triple tap). Off: no transcripts arrive and
-    /// `show` sends nothing to the band.
+    /// True while decisions mode is on (triple tap). Memory capture may temporarily suspend cues.
     pub fn decisions_on(&self) -> bool {
         self.decisions.load(SeqCst)
     }
 
+    /// True between waves, including when decisions mode is off. Speech is context only.
+    pub fn memory_on(&self) -> bool {
+        self.memory.load(SeqCst)
+    }
+
+    /// Sends the orchestrator's JSON (with a "type" field) to the UI event stream.
     pub fn publish(&self, json: &str) {
         self.hub.send(json);
     }
@@ -371,5 +404,38 @@ mod tests {
     #[test]
     fn json_escapes() {
         assert_eq!(json_str("say \"$1,150\"\n\\ok\u{1}"), r#""say \"$1,150\"\n\\ok\u0001""#);
+    }
+
+    #[test]
+    fn cues_require_a_current_conversation_turn_and_both_layers_accepting() {
+        let pipeline = Python::with_gil(|py| {
+            PyModule::from_code_bound(py, "accept = True\ndef set_cue(*args):\n    return accept\n", "cue_test.py", "cue_test")
+                .unwrap().unbind()
+        });
+        let (_, rx) = channel();
+        let b = Bridge {
+            decisions: Arc::new(AtomicBool::new(false)),
+            memory: Arc::new(AtomicBool::new(false)),
+            decision_turn: Arc::new(AtomicU64::new(1)),
+            rx, turns: Arc::new(Turns::default()), hub: Arc::new(Hub::default()), pipeline,
+        };
+        b.turns.assign(true);
+        assert!(!b.show(1, Cue::Ask).unwrap()); // decisions start off
+        b.decisions.store(true, SeqCst);
+        assert!(!b.show(0, Cue::Ask).unwrap()); // no transcript has turn zero
+        assert!(b.show(1, Cue::Ask).unwrap());
+        b.memory.store(true, SeqCst);
+        assert!(!b.show(1, Cue::Ask).unwrap()); // waves suspend decision cues
+        b.memory.store(false, SeqCst);
+        b.decision_turn.store(0, SeqCst);
+        assert!(!b.show(1, Cue::Ask).unwrap()); // previous session or capture boundary
+        b.turns.assign(true);
+        assert!(!b.show(2, Cue::Ask).unwrap()); // context can never trigger a cue
+        b.decision_turn.store(2, SeqCst);
+        assert!(!b.show(1, Cue::Ask).unwrap()); // stale conversation turn
+        Python::with_gil(|py| b.pipeline.bind(py).setattr("accept", false).unwrap());
+        assert!(!b.show(2, Cue::Ask).unwrap()); // Python transitioning: never claim shown
+        Python::with_gil(|py| b.pipeline.bind(py).setattr("accept", true).unwrap());
+        assert!(b.show(2, Cue::Ask).unwrap());
     }
 }

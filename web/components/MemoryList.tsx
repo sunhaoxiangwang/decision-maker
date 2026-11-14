@@ -32,7 +32,8 @@ export default function MemoryList({ items, uses, highlight, onSave, onConfirm, 
                   {onSave ? (
                     <form onSubmit={(e) => { e.preventDefault(); onSave(m, String(new FormData(e.currentTarget).get('text') ?? '')); }}>
                       {/* key: reset the field when the stored text changes */}
-                      <input key={m.text} name="text" defaultValue={m.text} aria-label={`Memory about ${m.subject}`} title="Edit, then press Enter to save" />
+                      <textarea key={m.text} name="text" rows={Math.min(5, m.text.split('\n').length)} defaultValue={m.text} aria-label={`Memory about ${m.subject}`} />
+                      <button className="ghost">Save</button>
                     </form>
                   ) : m.text}
                   {m.keywords.length > 0 && <small> {m.keywords.join(' · ')}</small>}

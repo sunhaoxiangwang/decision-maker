@@ -1,7 +1,7 @@
 'use client';
 import Link from 'next/link';
 import { useState } from 'react';
-import ContextConfirm from '@/components/ContextConfirm';
+import MemoryCapture from '@/components/MemoryCapture';
 import Conversation from '@/components/Conversation';
 import DecisionCard from '@/components/DecisionCard';
 import GoalsForm from '@/components/GoalsForm';
@@ -71,7 +71,8 @@ export default function Live() {
               <h1>Decisions mode is off</h1>
               <p className="muted">
                 Triple-tap the band to start. It blinks green five times, then listens: a new conversation opens here
-                and each speaker&apos;s words stream in. Triple-tap again to stop (red five times); nothing is heard or saved while it&apos;s off.
+                and each speaker&apos;s words stream in. Triple-tap again to stop (red five times).
+                Wave to record memory; wave again to stop. Memory capture also works with decisions off.
                 Past conversations are in <Link href="/memory">Memory</Link>.
               </p>
             </div>
@@ -89,7 +90,7 @@ export default function Live() {
           )}
         </div>
         <div className="dock">
-          <ContextConfirm state={state} dispatch={dispatch} />
+          <MemoryCapture state={state} />
           <GoalsForm session={session} save={save} />
           <p className="fine">
             {offline
