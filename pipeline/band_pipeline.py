@@ -5,7 +5,9 @@ thread and set_cue() whenever the backend has a decision. Only this process conn
 the band (one Bluetooth connection, AGENTS.md rule 7).
 
 Live mode: one Deepgram WebSocket stays open and the band's audio streams into it with no
-taps. Every pause Deepgram hears ends a turn (final=True).
+taps. A turn ends on Deepgram's UtteranceEnd: a gap after the last recognised *word*,
+worked out from the transcript's word timings, so background noise cannot hold a turn
+open the way it holds open the audio silence detector (speech_final, ignored here).
 """
 import sys
 import threading
@@ -15,15 +17,41 @@ sys.stdout.reconfigure(line_buffering=True)  # embedded Python: print lines as t
 KIT = Path(__file__).resolve().parent.parent / "vexo-open-kit"
 sys.path.insert(0, str(KIT / "examples" / "python"))  # speech.py (finds the library itself)
 
-ENDPOINTING_MS = 500  # pause that ends a turn; the kit's 100 ms splits sentences mid-thought
+UTTERANCE_END_MS = 1000  # gap after the last word that ends a turn (Deepgram's minimum is 1000)
 CUE_HOLD_S = 2.0      # the light only shows with the mic off; speech in this window is not heard
 
 band = None
+ears = None
 _resume = None
+
+import speech  # noqa: E402  (after the path line above)
+
+
+class Diarized(speech.DeepgramSpeech):
+    """The kit's Deepgram engine with transcript-based turns and the speaker of the latest
+    words (diarize=true). Empty text (silence, noise) is never passed on."""
+    speaker = None
+
+    def __init__(self, **options):
+        super().__init__(diarize="true", utterance_end_ms=UTTERANCE_END_MS, **options)
+
+    def _message(self, message):
+        if message.get("type") == "UtteranceEnd":
+            self._sentence_ends()  # emits only if words were recognised
+            return
+        alts = (message.get("channel") or {}).get("alternatives") or [{}]
+        found = [w["speaker"] for w in alts[0].get("words") or [] if "speaker" in w]
+        if found:
+            self.speaker = max(set(found), key=found.count)
+        super()._message(dict(message, speech_final=False))  # the audio VAD never ends a turn
+
+    def _say(self, text, final):
+        if (text or "").strip():
+            super()._say(text, final)
 
 
 def run(band_number):
-    global band
+    global band, ears
     if band_number is None:
         print("TYPED input (no band, no microphone): one line per turn.")
         for line in sys.stdin:
@@ -31,22 +59,10 @@ def run(band_number):
                 emit(line.strip(), None, True)  # noqa: F821  (set by Rust)
         return
 
-    import speech
     from vexo_open.sync import Band
 
-    class Diarized(speech.DeepgramSpeech):
-        """The kit's Deepgram engine, plus the speaker of the latest words (diarize=true)."""
-        speaker = None
-
-        def _message(self, message):
-            alts = (message.get("channel") or {}).get("alternatives") or [{}]
-            found = [w["speaker"] for w in alts[0].get("words") or [] if "speaker" in w]
-            if found:
-                self.speaker = max(set(found), key=found.count)
-            super()._message(message)
-
     band = Band.connect(band_number, auto_reconnect=True)
-    ears = Diarized(endpointing=ENDPOINTING_MS, diarize="true")
+    ears = Diarized()
     ears.start(lambda text, final: emit(text, ears.speaker, final))  # noqa: F821
     band.on("audio", ears.feed)
     band.configure(audio=True)  # solid blue: the microphone is on
@@ -63,6 +79,8 @@ def set_cue(hex_colour, pattern):
         return
     if _resume:
         _resume.cancel()
+    if ears:
+        ears._sentence_ends()  # words heard so far become a turn; with no sound, no UtteranceEnd would come
     band.configure(audio=False, mic_level=False)
     if hex_colour:
         band.set_led(hex_colour, pattern=pattern, period=600)
