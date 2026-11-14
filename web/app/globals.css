@@ -152,3 +152,7 @@ td.note small { display: block; }
 .context-confirm { display: grid; gap: 8px; margin-bottom: 10px; padding: 12px 14px; border-radius: 16px; border: 1px solid var(--purple); background: color-mix(in srgb, var(--purple) 8%, transparent); }
 .context-confirm .filters { margin: 0; }
 .chip.on { color: var(--green); border-color: var(--green); }
+
+.chip.flash { animation: flash 1.2s ease-out; }
+@keyframes flash { from { background: var(--hover); color: inherit; } }
+@media (prefers-reduced-motion: reduce) { .chip.flash { animation: none; } }

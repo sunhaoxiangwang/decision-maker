@@ -23,26 +23,33 @@ process = subprocess.Popen(
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
 )
 events, incoming = [], queue.Queue()
+cursor = [0]
 
 
-def subscribe():
+def subscribe(last_event_id=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    connection.request("GET", "/events", headers={"Origin": "http://localhost:3000"})
+    headers = {"Origin": "http://localhost:3000"}
+    if last_event_id is not None:
+        headers["Last-Event-ID"] = str(last_event_id)
+    connection.request("GET", "/events", headers=headers)
     response = connection.getresponse()
     assert response.status == 200
     return connection, response
 
 
 def read_events(response):
+    event_id = 0
     for line in response:
+        if line.startswith(b"id: "):
+            event_id = int(line[4:])
         if line.startswith(b"data: "):
-            incoming.put(json.loads(line[6:]))
+            incoming.put((json.loads(line[6:]), event_id))
 
 
 def expect(kind, **fields):
     deadline = time.monotonic() + 5
     while True:
-        event = incoming.get(timeout=max(0.01, deadline - time.monotonic()))
+        event, cursor[0] = incoming.get(timeout=max(0.01, deadline - time.monotonic()))
         events.append(event)
         if event["type"] == kind and all(event.get(k) == v for k, v in fields.items()):
             return event
@@ -80,6 +87,7 @@ try:
     assert json.loads(replay.readline()[6:])["decisions"] is True
     assert replay.readline() == b"\n"
     assert json.loads(replay.readline()[6:])["memory"] is True
+    replay.close()
     replay_connection.close()
     for text in ["Budget: $1,300.", "Delivery must be included!"]:
         send(text)
@@ -104,8 +112,29 @@ try:
     send("Second conversation.")
     second = expect("transcript", text="Second conversation.", purpose="conversation")
     expect("cue", turn_id=second["turn_id"], shown=True)
+    replay_after = cursor[0]
     send("/triple")
     expect("mode", decisions=False, conversation=2)
+
+    # An incomplete HTTP client cannot freeze the accept loop.
+    idle = socket.create_connection(("127.0.0.1", port), timeout=2)
+    started = time.monotonic()
+    active, caught_up = subscribe(replay_after)
+    assert time.monotonic() - started < 1.0
+    while True:
+        line = caught_up.readline()
+        if line.startswith(b"data: "):
+            event = json.loads(line[6:])
+            if event["type"] == "mode":
+                assert event["decisions"] is False and event["conversation"] == 2
+                break
+    caught_up.close()
+    active.close()
+    idle.close()
+    expired_connection, expired = subscribe(999999999)
+    assert json.loads(expired.readline()[6:])["type"] == "gap"
+    expired.close()
+    expired_connection.close()
 
     transcripts = [e for e in events if e["type"] == "transcript"]
     assert len(transcripts) == 6, transcripts
@@ -136,7 +165,7 @@ try:
     process.stdin.close()
     process.wait(timeout=5)
     assert process.returncode == 0, process.stdout.read()
-    print("Python → Rust → SSE → frontend: decisions, wave memory, history and reload passed")
+    print("Python → Rust → SSE → frontend: decisions, wave memory, history, reload, idle clients and reconnect replay passed")
 finally:
     if process.poll() is None:
         process.terminate()

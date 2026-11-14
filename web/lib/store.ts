@@ -1,3 +1,4 @@
+import { boundState, byteSize, MAX_TEXT_BYTES, MAX_MEMORY_BYTES, MAX_NOTE_BYTES, MAX_TURNS } from './limits.ts';
 // Event shapes from docs/frontend-plan.md, and the reducer that folds them into UI state.
 // No runtime imports here, so `node --test` can load this file directly.
 
@@ -46,8 +47,9 @@ export type ConversationTurn = { turn_id: number; speaker: number | null; text: 
 export type Conversation = { id: string; started_ms: number; mode: Mode; turns: ConversationTurn[]; extracted_ms?: number };
 export type MemoryEvent = { type: 'memory'; op: 'proposed' | 'confirmed' | 'updated' | 'deleted'; item: MemoryItem };
 export type StatusEvent = { type: 'status'; band: 'connected' | 'reconnecting' | 'off'; mic: 'live' | 'cue-hold' | 'off' };
-export type BridgeEvent = TranscriptEvent | CueEvent | DecisionEvent | MemoryEvent | StatusEvent | GestureEvent | ModeEvent;
-export const BRIDGE_EVENTS = new Set(['transcript', 'cue', 'decision', 'memory', 'status', 'gesture', 'mode']);
+export type GapEvent = { type: 'gap'; message: string };
+export type BridgeEvent = TranscriptEvent | CueEvent | DecisionEvent | MemoryEvent | StatusEvent | GestureEvent | ModeEvent | GapEvent;
+export const BRIDGE_EVENTS = new Set(['transcript', 'cue', 'decision', 'memory', 'status', 'gesture', 'mode', 'gap']);
 
 // Spoken context between waves. Each final turn is saved as given, without a model call.
 export type PendingContext = { listening: boolean; text: string; interim: string; turn_ids: number[]; time_ms: number };
@@ -80,6 +82,8 @@ export type State = {
   session: Session;
   latest: number | null; // turn of the newest cue or decision
   pinned: number | null; // turn the user clicked; wins over `latest`
+  notice: string | null;
+  gesture: { name: 'triple tap' | 'wave'; on: boolean; time_ms: number } | null; // the latest one, for the top bar
   loaded: boolean;       // saved decisions and memory have been read from this browser
 };
 
@@ -91,7 +95,8 @@ export type Action =
   | { type: 'forget-decisions' }
   | { type: 'new-conversation' }
   | { type: 'extracted'; id: string; time_ms: number }
-  | { type: 'delete-conversation'; id: string };
+  | { type: 'delete-conversation'; id: string }
+  | { type: 'dismiss-notice' };
 
 // What is kept in this browser's localStorage between visits.
 export type Saved = Pick<State, 'decisions' | 'memory' | 'session' | 'conversations' | 'current'>;
@@ -99,7 +104,7 @@ export type Saved = Pick<State, 'decisions' | 'memory' | 'session' | 'conversati
 export const initial: State = {
   turns: {}, decisions: {}, memory: {}, conversations: {}, current: null, context: null, decisionsOn: null, modeTime: null, status: null,
   session: { mode: 'negotiation', goals: [] },
-  latest: null, pinned: null, loaded: false,
+  latest: null, pinned: null, notice: null, gesture: null, loaded: false,
 };
 
 export const selectedTurn = (s: State) => s.pinned ?? s.latest;
@@ -115,10 +120,36 @@ const turnOf = (s: State, turn_id: number, time_ms: number): Turn =>
   s.turns[turn_id] ?? { turn_id, speaker: null, text: '', final: true, time_ms };
 
 export function reducer(s: State, a: Action): State {
+  if (a.type === 'transcript' && new TextEncoder().encode(a.text).length > MAX_TEXT_BYTES) {
+    return { ...s, notice: 'Transcript exceeds the per-turn limit and was rejected. History may be incomplete.' };
+  }
+  if (a.type === 'session' && (a.session.goals.length > 32 || byteSize(a.session) > MAX_TEXT_BYTES)) {
+    return { ...s, notice: 'Goals exceed the session size limit and were not saved.' };
+  }
+  const next = reduceEvent(s, a);
+  if (next.memory !== s.memory) {
+    if (Object.keys(next.memory).length > 256 || byteSize(next.memory) > MAX_MEMORY_BYTES
+        || Object.values(next.memory).some((m) => byteSize(m) > MAX_NOTE_BYTES)) {
+      return { ...s, loaded: next.loaded, notice: 'Memory storage limit reached. New memory was not saved. Wave to stop recording and delete or export older memory.' };
+    }
+  }
+  // Interims update only the visible turn/context; do not scan/serialize all history for them.
+  if (next.conversations === s.conversations && next.decisions === s.decisions) {
+    const turns = Object.values(next.turns).sort((a, b) => a.turn_id - b.turn_id);
+    return turns.length <= MAX_TURNS ? next : { ...next, turns: Object.fromEntries(turns.slice(-MAX_TURNS).map((t) => [t.turn_id, t])) };
+  }
+  return boundState(next);
+}
+
+function reduceEvent(s: State, a: Action): State {
   switch (a.type) {
+    case 'gap':
+      return { ...s, notice: a.message };
+    case 'dismiss-notice':
+      return { ...s, notice: null };
     case 'transcript': {
       if (a.purpose === 'context') return heardContext(s, a);
-      if (s.decisionsOn === false || s.context) return s;
+      if (!s.decisionsOn || s.context) return s; // null: the bridge has not said decisions mode is on
       if (a.final && a.text) return keep(s, a);
       const prev = s.turns[a.turn_id];
       if (prev?.final && !a.final) return s; // interim never overwrites the final text
@@ -126,7 +157,7 @@ export function reducer(s: State, a: Action): State {
       return { ...s, turns: { ...s.turns, [a.turn_id]: { ...prev, ...t } } };
     }
     case 'cue': {
-      if (s.decisionsOn === false || s.context) return s;
+      if (!s.decisionsOn || s.context) return s; // null: the bridge has not said decisions mode is on
       const turn = { ...turnOf(s, a.turn_id, a.time_ms), cue: a.cue, shown: a.shown };
       const d = turn.decisionId ? s.decisions[turn.decisionId] : undefined;
       return {
@@ -136,7 +167,7 @@ export function reducer(s: State, a: Action): State {
       };
     }
     case 'decision': {
-      if (s.decisionsOn === false || s.context) return s;
+      if (!s.decisionsOn || s.context) return s; // null: the bridge has not said decisions mode is on
       const context = visibleTurns(s).filter((t) => t.text && t.turn_id <= a.turn_id).slice(-4)
         .map(({ turn_id, speaker, text }) => ({ turn_id, speaker, text }));
       return {
@@ -151,19 +182,22 @@ export function reducer(s: State, a: Action): State {
     }
     case 'mode': {
       if (s.modeTime === a.time_ms && s.decisionsOn === a.decisions) return s; // replayed on reconnect
+      // conversation 0 is the bridge's start-up state, not a tap
+      const gesture = a.conversation > 0 ? { name: 'triple tap' as const, on: a.decisions, time_ms: a.time_ms } : s.gesture;
       // Off: the conversation ends (dropped if nobody spoke). On: a new one opens, the screen clears.
       const conv = s.current ? s.conversations[s.current] : undefined;
       const { [conv?.id ?? '']: empty, ...others } = s.conversations;
       const conversations = conv && conv.turns.length === 0 ? others : s.conversations;
-      if (!a.decisions) return { ...s, decisionsOn: false, modeTime: a.time_ms, current: null, conversations, turns: {}, latest: null, pinned: null };
+      if (!a.decisions) return { ...s, gesture, decisionsOn: false, modeTime: a.time_ms, current: null, conversations, turns: {}, latest: null, pinned: null };
       const c: Conversation = { id: `c${a.time_ms}-m${a.conversation}`, started_ms: a.time_ms, mode: s.session.mode, turns: [] };
       const restored = conversations[c.id] ?? c;
-      return { ...s, decisionsOn: true, modeTime: a.time_ms, current: c.id, conversations: { ...conversations, [c.id]: restored }, turns: Object.fromEntries(restored.turns.map((t) => [t.turn_id, { ...t, final: true }])), latest: null, pinned: null };
+      return { ...s, gesture, decisionsOn: true, modeTime: a.time_ms, current: c.id, conversations: { ...conversations, [c.id]: restored }, turns: Object.fromEntries(restored.turns.map((t) => [t.turn_id, { ...t, final: true }])), latest: null, pinned: null };
     }
     case 'gesture':
-      if (!a.memory) return { ...s, context: null };
+      // memory:false with nothing recording is the bridge's start-up state, not a wave
+      if (!a.memory) return s.context ? { ...s, context: null, gesture: { name: 'wave', on: false, time_ms: a.time_ms } } : s;
       if (s.context?.time_ms === a.time_ms) return s;
-      return { ...s, context: { listening: true, text: s.memory[`wave-${a.time_ms}`]?.text ?? '', interim: '', turn_ids: [], time_ms: a.time_ms } };
+      return { ...s, gesture: { name: 'wave', on: true, time_ms: a.time_ms }, context: { listening: true, text: s.memory[`wave-${a.time_ms}`]?.text ?? '', interim: '', turn_ids: [], time_ms: a.time_ms } };
     case 'status':
       return { ...s, status: { band: a.band, mic: a.mic } };
     case 'pin':

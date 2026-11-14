@@ -13,7 +13,7 @@ const LINK = {
 
 export default function Sidebar() {
   const path = usePathname();
-  const { state, link } = useBridge();
+  const { state, dispatch, link, storageError } = useBridge();
   return (
     <nav className="side">
       <div className="brand">Decision Maker</div>
@@ -22,6 +22,8 @@ export default function Sidebar() {
       ))}
       <div className="foot">
         <span><Dot color={LINK[link][0]} /> {LINK[link][1]}</span>
+        {storageError && <p role="alert">{storageError}</p>}
+        {state.notice && <div role="alert">{state.notice} <button className="ghost" onClick={() => dispatch({ type: 'dismiss-notice' })}>Dismiss</button></div>}
         {state.status && <span className="muted">Band {state.status.band}</span>}
       </div>
     </nav>

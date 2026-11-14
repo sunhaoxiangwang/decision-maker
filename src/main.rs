@@ -31,7 +31,7 @@ fn main() {
         );
         if cue && t.is_final && t.purpose == Purpose::Conversation {
             let start = Instant::now();
-            let shown = bridge.show(t.turn_id, Cue::Ask);
+            let shown = bridge.show(&t, Cue::Ask);
             println!("  cue Ask -> {shown:?} in {} ms", start.elapsed().as_millis());
         }
     }

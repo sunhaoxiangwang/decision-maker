@@ -35,7 +35,8 @@ export function retrieve(items: MemoryItem[], query: string, opts: { subject?: s
     })
     .filter(({ m, score }) => score > 0 || always(m))
     .sort((a, b) => b.score - a.score || b.m.saved_ms - a.m.saved_ms);
-  return scored.slice(0, opts.k ?? 8).map(({ m }) => m);
+  const optional = new Set(scored.filter(({ m }) => !always(m)).slice(0, Math.max(0, opts.k ?? 8)).map(({ m }) => m.id));
+  return scored.filter(({ m }) => always(m) || optional.has(m.id)).map(({ m }) => m);
 }
 
 /** One note as the decision API receives it. */

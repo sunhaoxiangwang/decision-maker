@@ -1,0 +1,4 @@
+[env]
+# Pinned project environment, rather than whichever python3 happens to be on PATH.
+# An explicit PYO3_PYTHON still wins.
+PYO3_PYTHON = { value = ".venv/bin/python3", relative = true }

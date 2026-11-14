@@ -6,12 +6,13 @@ import { asPrompt, forDecision, transcriptLines } from '@/lib/memory';
 import { useNames } from '@/lib/names';
 import { ago, type Conversation, type MemoryEvent, type MemoryItem } from '@/lib/store';
 import { useBridge } from '@/lib/useBridge';
+import { STORAGE_KEY } from '@/lib/storage';
 
 // Memory is written as sentences, two ways: from context the user types here, and from past
 // conversations (OpenAI, through app/llm/memory/route.ts). Everything is kept in this
 // browser's localStorage (lib/useBridge.tsx) and sent to the orchestrator when it changes.
 export default function MemoryPage() {
-  const { state, dispatch } = useBridge();
+  const { state, dispatch, storageError } = useBridge();
   const { name } = useNames();
   const [highlight, setHighlight] = useState('');
   const [busy, setBusy] = useState<string | null>(null); // 'context' or a conversation id
@@ -60,7 +61,20 @@ export default function MemoryPage() {
   return (
     <section className="page">
       <h1>Memory</h1>
-      <p className="muted">Stored in this browser and sent to the orchestrator. Wave to start recording memory; wave again to stop. Spoken memory is saved as the transcript, without summarizing.</p>
+      <button className="ghost" onClick={() => {
+        const saved = { decisions: state.decisions, memory: state.memory, session: state.session, conversations: state.conversations, current: state.current };
+        let text = JSON.stringify(saved, null, 2);
+        if (storageError?.startsWith('History could not be loaded:')) {
+          try { text = localStorage.getItem(STORAGE_KEY) ?? text; } catch { /* export the current in-memory copy */ }
+        }
+        const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'decision-maker-history.json';
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }}>Export history and memory</button>
+      <p className="muted">Saved in this browser only; the decision component is not connected. Wave to start recording memory; wave again to stop. Spoken memory is saved as the transcript, without summarizing.</p>
 
       <form className="context" onSubmit={(e) => { e.preventDefault(); addContext(e.currentTarget); }}>
         <textarea

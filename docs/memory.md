@@ -2,7 +2,7 @@
 
 Memory holds verbatim wave transcripts and extracted sentence notes, with where each came
 from. It is kept in the companion UI (the browser's localStorage) and sent to the proposed
-orchestrator endpoint whenever it changes.
+orchestrator endpoint once that separate component exists. This branch saves memory locally only.
 
 ## Where notes come from
 
@@ -53,7 +53,7 @@ Conversation history is saved while **decisions mode** is on; wave capture is st
 
 ## Retrieval (`web/lib/memory.ts`)
 
-`retrieve(items, turnText, { subject })` returns the most relevant notes first (8 at most). Only confirmed notes are considered.
+`retrieve(items, turnText, { subject })` returns all mandatory constraints/user context plus at most 8 optional matches, ranked together. Only confirmed notes are considered.
 - Scoring:
   - Each of the note's keywords that the turn mentions: +2.
   - Any other word of the note that the turn mentions: +1.
@@ -78,11 +78,9 @@ Conversation history is saved while **decisions mode** is on; wave capture is st
 - The Live tab's right-hand pane shows exactly the `memory` retrieval picks for the selected or latest turn.
 - The Memory tab's "As the decision API receives it" section shows every confirmed note in both formats.
 
-## Getting memory to the orchestrator (proposed)
+## Decision component (deferred)
 
-- Whenever memory changes, the UI sends `POST /api/memory { memories: DecisionMemory[] }`. The `/api` rewrite in `next.config.mjs` forwards it to the orchestrator.
-- The orchestrator keeps that list and runs the same retrieval for each final turn it gets from `Bridge::next_transcript`. The keyword fields are there so this takes a few lines of Rust.
-- Until the orchestrator exists, the request fails quietly.
+Memory is local to the browser. This branch does not POST to the proposed memory endpoint or claim backend acknowledgement. The separate decision component must implement versioned, acknowledged replacement, reject stale revisions, and invalidate pending cues after memory changes. No decision generation is implemented here.
 
 ## Updating memory by gesture: wave → speak → wave
 
@@ -95,7 +93,7 @@ Waving toggles continuous memory capture, including while decisions mode is off.
 5. Wave again. The mic stops and the speech connection drains before Rust receives `set_memory_mode(false)`. The UI closes the capture indicator. If decisions mode was on, conversation listening resumes; otherwise the mic and LED turn off after the white flash.
 6. Triple-tapping also stops and saves any active memory capture before switching decisions mode. A new speech connection at each boundary prevents conversation and memory words from mixing.
 
-Mode and memory state are replayed to a UI connecting later. Transcript events have no server backlog: the UI must be connected during recording to save new speech. Memory and conversation history are kept in that browser's localStorage. The proposed orchestrator memory endpoint is still not implemented.
+Mode, memory and actual mic status are sent to a UI connecting later. Native EventSource reconnect can catch up within the bounded 128-event/1-MiB replay window; gaps outside that window are disclosed. The UI must remain open during recording to save new speech. Memory and conversation history are kept in that browser's localStorage. The proposed orchestrator memory endpoint is still not implemented.
 
 Calibration on the real band remains necessary:
 - `VEXO_GESTURE_DEBUG=1` prints tap events and peak turning rate on each gyro axis.
@@ -115,3 +113,5 @@ PYO3_PYTHON="$PWD/.venv/bin/python3" cargo build
 ```
 
 `test_band_pipeline.py` exercises the actual registered gesture handlers with fake hardware, checks LED/mic ordering and five-blink timing, drains the last words at mode boundaries, and verifies failures stay off. `test_bridge.py` runs the actual embedded Python/Rust process in typed mode, reads SSE, and folds those events through the frontend reducer to check memory, conversation history, clearing, and reload. These checks do not replace physically tapping/waving and observing the LED.
+
+See the root README for setup, explicit retention budgets, persistence errors, and the known microphone gaps during LED signals.

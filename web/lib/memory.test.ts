@@ -26,6 +26,16 @@ test('retrieve: matching notes first, constraints always, proposals never', () =
   assert.deepEqual(retrieve(memory, 'hello there').map((m) => m.id), ['budget']); // only the constraint
 });
 
+test('mandatory constraints and user context cannot be displaced by optional top-k', () => {
+  const constraints = Array.from({ length: 9 }, (_, i) => note(`limit-${i}`, 'constraint', 'user', `Required limit ${i}`, []));
+  const context = note('context', 'context', 'user', 'Budget is $1,200.', [], { source: { type: 'user' } });
+  const optional = Array.from({ length: 20 }, (_, i) => note(`offer-${i}`, 'fact', 'Seller', 'Price offer', ['price']));
+  const chosen = retrieve([...constraints, context, ...optional], 'price', { k: 2 });
+  assert.equal(chosen.length, 12);
+  assert.ok([...constraints, context].every((m) => chosen.includes(m)));
+  assert.equal(retrieve([...constraints, context, ...optional], 'price', { k: 0 }).length, 10);
+});
+
 test('decisionRequest: the turn, the turns before it, and its memory', () => {
   const conv = { id: 'c1', started_ms: 1, mode: 'negotiation' as const, turns: [
     { turn_id: 1, speaker: 0, text: 'Hi', time_ms: 1 },

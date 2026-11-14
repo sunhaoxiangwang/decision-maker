@@ -1,21 +1,15 @@
 // Calls from the browser.
-// - setSession, syncMemory: the orchestrator (PROPOSED in docs/frontend-plan.md), reached
+// - setSession: the orchestrator (PROPOSED in docs/frontend-plan.md), reached
 //   through the /api rewrite in next.config.mjs; they throw when it isn't there.
 // - extractMemory: this app's own server route, app/llm/memory/route.ts (OpenAI).
 import { MEMORY_KINDS, type MemoryItem, type MemorySource, type Session } from './store';
-import { words, type DecisionMemory } from './memory';
+import { words } from './memory';
 
 const post = (url: string, body: unknown) =>
   fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
 export async function setSession(session: Session): Promise<void> {
   const r = await post('/api/session', session);
-  if (!r.ok) throw new Error(`orchestrator answered ${r.status}`);
-}
-
-/** Keeps the orchestrator's copy of confirmed memory current, so decisions can use it. */
-export async function syncMemory(memories: DecisionMemory[]): Promise<void> {
-  const r = await post('/api/memory', { memories });
   if (!r.ok) throw new Error(`orchestrator answered ${r.status}`);
 }
 

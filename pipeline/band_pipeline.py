@@ -17,7 +17,9 @@ open the audio silence detector (speech_final, ignored here).
 Wave toggles memory capture, even with decisions off. All turns until the next wave are
 context, never decisions. The UI saves each finished turn as given, until capture stops.
 """
+import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -27,6 +29,7 @@ from pathlib import Path
 sys.stdout.reconfigure(line_buffering=True)  # embedded Python: print lines as they come
 KIT = Path(__file__).resolve().parent.parent / "vexo-open-kit"
 sys.path.insert(0, str(KIT / "examples" / "python"))  # speech.py (finds the library itself)
+sys.path.insert(0, str(KIT / "python"))  # vexo_open: run() needs it before speech is imported
 
 UTTERANCE_END_MS = 1000  # gap after the last word that ends a turn (Deepgram's minimum is 1000)
 CUE_HOLD_S = 2.0         # the light only shows with the mic off; speech in this window is not heard
@@ -51,33 +54,111 @@ band = None
 ears = None
 decisions_on = False
 memory_on = False
+_capture_failed = False
+_mic_state = "off"
+_band_state = "off"
 _resume = None
 _mode_lock = threading.Lock()
 
-import speech  # noqa: E402  (after the path line above)
+MAX_TEXT_BYTES = 8192
+MAX_UTTERANCE_S = 30
+SPEECH_WRITE_DEADLINE_S = 5
+_speech_lock = threading.RLock()
 
 
-class Diarized(speech.DeepgramSpeech):
-    """The kit's Deepgram engine with transcript-based turns and the speaker of the latest
-    words (diarize=true). Empty text (silence, noise) is never passed on."""
-    speaker = None
+def Diarized(**options):
+    # Typed input and gesture tests do not require the external kit or Bluetooth packages.
+    try:
+        import speech
+    except ModuleNotFoundError as e:
+        raise RuntimeError("Band speech requires scripts/setup.sh; see README.md") from e
 
-    def __init__(self, **options):
-        super().__init__(diarize="true", utterance_end_ms=UTTERANCE_END_MS, **options)
+    class BoundedSpeech(speech.DeepgramSpeech):
+        speaker = None
 
-    def _message(self, message):
-        if message.get("type") == "UtteranceEnd":
-            self._sentence_ends()  # emits only if words were recognised
-            return
-        alts = (message.get("channel") or {}).get("alternatives") or [{}]
-        found = [w["speaker"] for w in alts[0].get("words") or [] if "speaker" in w]
-        if found:
-            self.speaker = max(set(found), key=found.count)
-        super()._message(dict(message, speech_final=False))  # the audio VAD never ends a turn
+        def __init__(self):
+            super().__init__(diarize="true", utterance_end_ms=UTTERANCE_END_MS, **options)
+            self._utterance_started = time.monotonic()
 
-    def _say(self, text, final):
-        if (text or "").strip():
-            super()._say(text, final)
+        def start(self, on_text=None):
+            super().start(on_text)
+            original_send = self._ws.send
+            self._pending_sends = {}
+            self._pending_lock = threading.Lock()
+
+            def send(message, opcode=None):
+                identity = threading.get_ident()
+                with self._pending_lock:
+                    self._pending_sends[identity] = time.monotonic()
+                try:
+                    return original_send(message, opcode)
+                finally:
+                    with self._pending_lock:
+                        self._pending_sends.pop(identity, None)
+
+            self._ws.send = send
+            threading.Thread(target=self._write_watchdog, daemon=True).start()
+            return self
+
+        def _write_watchdog(self):
+            while not self._done.wait(0.1):
+                with self._pending_lock:
+                    oldest = min(self._pending_sends.values(), default=time.monotonic())
+                if time.monotonic() - oldest > SPEECH_WRITE_DEADLINE_S:
+                    # Do not acquire WebSocket's send lock: that is what may be blocked.
+                    try:
+                        self._ws.sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    _fail_capture("Speech service write timed out; capture stopped.", source=self)
+                    return
+
+        def _read(self):
+            try:
+                super()._read()
+            finally:
+                if not self._stopping and self.error:
+                    _fail_capture("Speech service disconnected; capture stopped.", source=self)
+
+        def _message(self, message):
+            with _speech_lock:
+                if message.get("type") == "UtteranceEnd":
+                    self._sentence_ends()
+                    return
+                alts = (message.get("channel") or {}).get("alternatives") or [{}]
+                words = alts[0].get("words") or []
+                found = [w["speaker"] for w in words if "speaker" in w]
+                if found:
+                    self.speaker = max(set(found), key=found.count)
+                piece = str(alts[0].get("transcript") or "")
+                if message.get("type") == "Results" and message.get("is_final"):
+                    if len(piece.encode("utf-8")) > MAX_TEXT_BYTES:
+                        self._sentence_ends()
+                        for start in range(0, len(piece), MAX_TEXT_BYTES // 4):
+                            self._say(piece[start:start + MAX_TEXT_BYTES // 4], True)
+                        return
+                    if (len(" ".join(self._parts + [piece]).encode("utf-8")) > MAX_TEXT_BYTES
+                            or time.monotonic() - self._utterance_started >= MAX_UTTERANCE_S):
+                        self._sentence_ends()
+                # The audio VAD never ends a turn. UtteranceEnd, time or size does.
+                super()._message(dict(message, speech_final=False))
+
+        def _sentence_ends(self):
+            with _speech_lock:
+                super()._sentence_ends()
+                self._utterance_started = time.monotonic()
+
+        def _say(self, text, final):
+            text = (text or "").strip()
+            if not text:
+                return
+            if not final and len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+                text = text.encode("utf-8")[:MAX_TEXT_BYTES].decode("utf-8", errors="ignore")
+            # The UI owns history; the speech adapter retains no lifetime finals list.
+            if self.on_text:
+                self.on_text(text, final)
+
+    return BoundedSpeech()
 
 
 class TapCounter:
@@ -121,15 +202,60 @@ class WaveDetector:
         return True
 
 
+def _status(mic=None, link=None):
+    global _mic_state, _band_state
+    if mic is not None:
+        _mic_state = mic
+    if link is not None:
+        _band_state = link
+    callback = globals().get("publish")
+    if callback:
+        callback(json.dumps({"type": "status", "band": _band_state, "mic": _mic_state}, separators=(",", ":")))
+
+
+def _idle():
+    if band:
+        band.led_off()
+    _status("off")
+
+
 def _now_ms():
     return int(time.time() * 1000)
 
 
 def _emit(text, final):
-    if not decisions_on and not memory_on:
-        return                 # off: nothing is sent or saved
-    purpose = "context" if memory_on else "conversation"
-    emit(text, ears.speaker if ears else None, final, purpose)  # noqa: F821  (set by Rust)
+    global decisions_on, memory_on, _capture_failed
+    with _speech_lock:
+        if not decisions_on and not memory_on:
+            return
+        purpose = "context" if memory_on else "conversation"
+        accepted = emit(text, ears.speaker if ears else None, final, purpose)  # noqa: F821
+        if accepted is False:
+            _fail_capture()
+
+
+def _fail_capture(message=None, source=None):
+    global decisions_on, memory_on, _capture_failed
+    with _speech_lock:
+        if source is not None and ears is not source:
+            return
+        if _capture_failed:
+            return
+        decisions_on, memory_on, _capture_failed = False, False, True
+        if message and globals().get("publish"):
+            publish(json.dumps({"type": "gap", "message": message}))  # noqa: F821
+        set_mode(False)  # noqa: F821
+        set_memory_mode(False)  # noqa: F821
+        threading.Thread(target=_stop_after_failure, daemon=True).start()
+
+
+def _stop_after_failure():
+    with _mode_lock:
+        if not _capture_failed:
+            return
+        _stop_listening()
+        if band:
+            band.led_off()
 
 
 def _start_listening():
@@ -138,9 +264,12 @@ def _start_listening():
         try:
             fresh = Diarized()
             fresh.start(_emit)
+            if getattr(fresh, "error", None):
+                fresh.stop()
+                raise RuntimeError("Speech connection closed before capture started")
             ears = fresh
-        except speech.SpeechError as e:
-            print("Listening stays off:", e)
+        except Exception as e:
+            print("Listening stays off:", type(e).__name__, "— check speech setup/key/connection (README.md).")
             return False
     return True
 
@@ -153,27 +282,31 @@ def _stop_listening():
         _resume = None
     if band:
         band.configure(audio=False, mic_level=False)
+    _status("off")
     if ears:
         try:
             ears.stop()
-        except speech.SpeechError as e:
-            print("Listening stopped:", e)
+        except Exception as e:
+            print("Listening stopped:", type(e).__name__)
         finally:
             ears = None
 
 
 def toggle_decisions():
     """Triple tap: decisions mode on or off. Hands the new mode to Rust (set_mode)."""
-    global decisions_on, memory_on
+    global decisions_on, memory_on, _capture_failed
     with _mode_lock:
+        _capture_failed = False
         _stop_listening()
+        if _capture_failed:
+            return
         if memory_on:
             memory_on = False
             set_memory_mode(False)  # noqa: F821  (Rust: save the captured transcript)
         if not decisions_on:
             if not _start_listening():
                 if band:
-                    _flash("#ff0000", "blink", MODE_BLINKS * BLINK_PERIOD_MS / 1000, then=band.led_off)
+                    _flash("#ff0000", "blink", MODE_BLINKS * BLINK_PERIOD_MS / 1000, then=_idle)
                 return
             decisions_on = True
             set_mode(True)  # noqa: F821  (Rust: new conversation, UI opens it)
@@ -183,14 +316,17 @@ def toggle_decisions():
             decisions_on = False
             set_mode(False)  # noqa: F821  (drained turns arrived before this event)
             print("Decisions mode OFF: not listening.")
-            _blink("#ff0000", then=band.led_off if band else None)
+            _blink("#ff0000", then=_idle if band else None)
 
 
 def on_wave():
     """Wave starts/stops continuous memory capture; drain before each boundary."""
-    global memory_on, decisions_on
+    global memory_on, decisions_on, _capture_failed
     with _mode_lock:
+        _capture_failed = False
         _stop_listening()
+        if _capture_failed:
+            return
         if memory_on:
             memory_on = False
             set_memory_mode(False)  # noqa: F821
@@ -208,23 +344,32 @@ def on_wave():
                 set_mode(False)  # noqa: F821
         if band:
             _flash("#ffffff", "solid", WAVE_ACK_S,
-                   then=_mic_on if decisions_on or memory_on else band.led_off)
+                   then=_mic_on if decisions_on or memory_on else _idle)
 
 
 def run(band_number):
     global band
     if band_number is None:
         print("TYPED input (no band, no microphone): one line per turn. /triple = triple tap, /wave = wave.")
-        for line in sys.stdin:
-            line = line.strip()
-            if line == "/triple":
+        while True:
+            line = sys.stdin.readline(MAX_TEXT_BYTES + 1)
+            if not line:
+                break
+            text = line.rstrip("\r\n")
+            if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+                while line and not line.endswith("\n"):
+                    line = sys.stdin.readline(MAX_TEXT_BYTES + 1)
+                publish(json.dumps({"type": "gap", "message": "Typed line exceeded the transcript byte limit and was rejected."}))  # noqa: F821
+                continue
+            command = text.strip()
+            if command == "/triple":
                 toggle_decisions()
-            elif line == "/wave":
+            elif command == "/wave":
                 on_wave()
-            elif line:
+            elif command:
                 if not decisions_on and not memory_on:
                     print("(listening is off: type /triple or /wave first)")
-                _emit(line, True)
+                _emit(text, True)
         return
 
     from vexo_open.sync import Band
@@ -262,12 +407,17 @@ def _watch_gestures(debug=False):
     band.on("double-tap", lambda e: on_tap(e, DOUBLE_TAP_COUNTS))
     band.on("motion", on_motion)
     band.set_events(kinds=["tap", "double-tap"], tap_threshold=TAP_THRESHOLD_G)
+    band.on("reconnecting", lambda _: _status("off", "reconnecting"))
+    band.on("reconnected", lambda _: _mic_on() if decisions_on or memory_on else _status("off", "connected"))
+    band.on("disconnect", lambda _: _status("off", "off"))
     band.configure(events=True, motion=50)  # mic stays off until a triple tap or wave
+    _status("off", "connected")
 
 
 def _mic_on():
     if band and (decisions_on or memory_on):
         band.configure(audio=True)  # solid blue: the microphone is on
+        _status("live", "connected")
 
 
 def _blink(hex_colour, then):
@@ -277,34 +427,53 @@ def _blink(hex_colour, then):
         print("TYPED light (no band): %s blinks %d times" % (hex_colour, MODE_BLINKS))
 
 
-def set_cue(hex_colour, pattern):
+def set_cue(hex_colour, pattern, validate=lambda: True):
     """Mic off (the band refuses LED commands otherwise), light for CUE_HOLD_S, mic back on."""
     if not _mode_lock.acquire(blocking=False):
         return False
     try:
         if not decisions_on or memory_on:
             return False
-        if band is None:
-            print("TYPED cue (no band):", hex_colour or "off", pattern)
-        else:
+        if band:
+            band.configure(audio=False, mic_level=False)
+        # Flush first, then validate at the actual LED operation. The same locks protect
+        # speech delivery, mode changes and LED commands, including blocking band calls.
+        with _speech_lock:
             if ears:
                 ears._sentence_ends()
-            _flash(hex_colour, pattern, CUE_HOLD_S, then=_mic_on)
-        return True
+            if not validate():
+                _mic_on()
+                return False
+            if band is None:
+                print("TYPED cue (no band):", hex_colour or "off", pattern)
+            else:
+                _flash(hex_colour, pattern, CUE_HOLD_S, then=_mic_on, mic_paused=True)
+            return True
     finally:
         _mode_lock.release()
 
 
-def _flash(hex_colour, pattern, seconds, then):
+def _flash(hex_colour, pattern, seconds, then, mic_paused=False):
     """Mic off, the light for `seconds`, then `then()` (mic back on, or light off)."""
     global _resume
     if _resume:
         _resume.cancel()
-    band.configure(audio=False, mic_level=False)
-    if hex_colour:
-        band.set_led(hex_colour, pattern=pattern, period=BLINK_PERIOD_MS if pattern == "blink" else 600)
-    else:
-        band.led_off()
+    _resume = None
+    if not mic_paused:
+        band.configure(audio=False, mic_level=False)
+    _status("cue-hold")
+    try:
+        if hex_colour:
+            band.set_led(hex_colour, pattern=pattern, period=BLINK_PERIOD_MS if pattern == "blink" else 600)
+        else:
+            band.led_off()
+    except Exception:
+        # A failed LED command must not leave speech paused forever or report success.
+        if decisions_on or memory_on:
+            _mic_on()
+        else:
+            _status("off")
+        raise
     def finish():
         with _mode_lock:
             if _resume is timer and then:

@@ -6,8 +6,12 @@
 //    | { source: 'user', text: "…" }
 // →    { memories: [{ kind, subject, text, keywords, turn_ids }] }
 
+import { BodyLimitError, BodyTimeoutError, readBoundedJson } from '../../../lib/http.ts';
+
 const MODEL = process.env.OPENAI_MODEL ?? 'gpt-6-luna'; // the kit's default model
 const MAX_CHARS = 60_000;
+const MAX_BODY_BYTES = 64 * 1024;
+let activeRequests = 0;
 
 const SCHEMA = {
   type: 'object', additionalProperties: false, required: ['memories'],
@@ -47,10 +51,19 @@ An empty list is a valid answer.`;
 const bad = (status: number, error: string) => Response.json({ error }, { status });
 
 export async function POST(req: Request) {
+  if (activeRequests >= 2) return bad(503, 'Memory extraction is busy. Try again shortly.');
+  activeRequests++;
+  try { return await extract(req); }
+  finally { activeRequests--; }
+}
+
+async function extract(req: Request) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) return bad(503, 'No OpenAI key on the server: set OPENAI_API_KEY in web/.env.local and restart npm run dev.');
 
-  const body = await req.json().catch(() => null);
+  let body: any;
+  try { body = await readBoundedJson(req, MAX_BODY_BYTES); }
+  catch (e) { return bad(e instanceof BodyLimitError ? 413 : e instanceof BodyTimeoutError ? 408 : 400, 'Invalid, oversized or timed-out JSON body.'); }
   let input: string;
   if (body?.source === 'conversation' && typeof body.transcript === 'string' && typeof body.conversation_id === 'string') {
     input = `A conversation (one line per turn: t<number> <speaker>: <words>):\n${body.transcript}`;
@@ -63,9 +76,10 @@ export async function POST(req: Request) {
 
   const r = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
+    signal: AbortSignal.any([req.signal, AbortSignal.timeout(20_000)]),
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: MODEL, instructions: INSTRUCTIONS, input,
+      model: MODEL, max_output_tokens: 2048, instructions: INSTRUCTIONS, input,
       text: { format: { type: 'json_schema', name: 'memories', schema: SCHEMA, strict: true } },
     }),
   }).catch(() => null);
@@ -73,7 +87,9 @@ export async function POST(req: Request) {
   if (!r) return bad(502, 'Could not reach api.openai.com.');
   if (!r.ok) return bad(502, `OpenAI answered status ${r.status}.`);
 
-  const out = await r.json();
+  let out: any;
+  try { out = await readBoundedJson(r, MAX_BODY_BYTES); }
+  catch { return bad(502, 'The model response was invalid or exceeded the byte/time limit.'); }
   const text: string | undefined = out?.output
     ?.flatMap((o: { type: string; content?: { type: string; text?: string }[] }) => (o.type === 'message' ? o.content ?? [] : []))
     .find((c: { type: string }) => c.type === 'output_text')?.text;

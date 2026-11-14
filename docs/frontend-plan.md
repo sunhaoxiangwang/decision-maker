@@ -68,14 +68,14 @@ The UI should code against these shapes and fall back gracefully until they exis
 | # | UI need | Backend function | Transport | Status |
 |---|---|---|---|---|
 | 1 | Live transcript (interim and final, speaker, turn) | `emit` → bridge, streamed by the `Hub` in `src/bridge.rs` | Server-Sent Events `GET http://127.0.0.1:8787/events`, event `transcript` | **Built** |
-| 2 | Cue sent to the band | `Bridge::show(turn_id, cue)` | Server-Sent Events, event `cue` | **Built** |
+| 2 | Cue sent to the band | `Bridge::show(&transcript, cue)` | Server-Sent Events, event `cue` | **Built** |
 | 3 | Decision with reason, facts and memory used | Orchestrator calls `Bridge::publish(json)` after deciding | Server-Sent Events, event `decision` | **Proposed** (`publish` is built) |
 | 4 | Memory changes during a session | Orchestrator calls `Bridge::publish` | Server-Sent Events, event `memory` | **Proposed** |
-| 5 | Mic and band status | Python pipeline → bridge publish | Server-Sent Events, event `status` | **Proposed** |
+| 5 | Mic and band status | Python pipeline → bridge publish | Server-Sent Events, event `status` | **Built** |
 | 6 | Set mode, goals and lunch options | Orchestrator `POST /session` | HTTP JSON | **Proposed** |
 | 7 | Past decisions | Orchestrator `GET /decisions?mode=&cue=&session=`, `GET /decisions/:id` | HTTP JSON | **Proposed** |
-| 8 | Memory for decisions | UI → orchestrator `POST /api/memory` with every confirmed note whenever memory changes. The memory itself lives in the browser (see `docs/memory.md`) | HTTP JSON | UI side **built**, orchestrator **proposed** |
-| 9 | Catch up after a reload | Orchestrator `GET /session/transcript` (the Server-Sent Events stream has no backlog) | HTTP JSON | **Proposed** |
+| 8 | Memory for decisions | Versioned, acknowledged sync belongs to the separate decision component. This branch keeps memory local and makes no sync requests. | HTTP JSON | **Deferred** |
+| 9 | Catch up after reconnect | SSE Last-Event-ID, bounded to 128 events / 1 MiB; expired replay produces a visible gap warning. Browser history restores on reload. | Server-Sent Events | **Built**, finite backlog |
 
 ### Connection rules (already enforced by the bridge)
 - It listens on `127.0.0.1` only.

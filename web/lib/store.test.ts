@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { initial, reducer, selectedTurn, visibleTurns, type Action, type DecisionEvent } from './store.ts';
 
-const run = (actions: Action[], from = initial) => actions.reduce(reducer, from);
+// Decisions mode on (the bridge's first triple tap), as for live speech.
+const on = reducer(initial, { type: 'mode', decisions: true, conversation: 1, time_ms: 0 });
+const run = (actions: Action[], from = on) => actions.reduce(reducer, from);
 
 const decision = (id: string, turn_id: number, cue: DecisionEvent['cue']): DecisionEvent => ({
   type: 'decision', id, turn_id, mode: 'negotiation', cue, reason: 'r', facts: [], missing: ['return_nights'], conflicts: [],
@@ -165,4 +167,18 @@ test('a missed off/on while disconnected opens a new session, while a reload res
   assert.notEqual(s.current, first);
   assert.deepEqual(visibleTurns(s), []);
   assert.equal(s.conversations[first].turns[0].text, 'first');
+});
+
+test('nothing is shown until a triple tap; the latest gesture is remembered, start-up state is not', () => {
+  const say: Action = { type: 'transcript', turn_id: 1, speaker: 0, text: 'too early', final: true, time_ms: 1 };
+  let s = run([say], initial); // the bridge has not said decisions mode is on
+  assert.deepEqual([visibleTurns(s), s.conversations], [[], {}]);
+  s = run([{ type: 'mode', decisions: false, conversation: 0, time_ms: 1 }, { type: 'gesture', name: 'wave', memory: false, time_ms: 1 }], initial);
+  assert.equal(s.gesture, null);
+  s = run([{ type: 'mode', decisions: true, conversation: 1, time_ms: 2 }], s);
+  assert.deepEqual(s.gesture, { name: 'triple tap', on: true, time_ms: 2 });
+  s = run([{ type: 'gesture', name: 'wave', memory: true, time_ms: 3 }], s);
+  assert.deepEqual(s.gesture, { name: 'wave', on: true, time_ms: 3 });
+  s = run([{ type: 'gesture', name: 'wave', memory: false, time_ms: 4 }], s);
+  assert.deepEqual(s.gesture, { name: 'wave', on: false, time_ms: 4 });
 });

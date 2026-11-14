@@ -6,34 +6,43 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import band_pipeline as bp
-import speech
+import importlib.util
+assert importlib.util.find_spec("vexo_open"), "run() imports vexo_open before speech is ever imported"
+try:
+    import speech
+except ModuleNotFoundError:
+    speech = None
 
-out = []
-ears = bp.Diarized()
-speech.Speech.start(ears, lambda text, final: out.append((text, ears.speaker, final)))  # no network
-ears._parts = []
+if speech is not None:
+    out = []
+    ears = bp.Diarized()
+    speech.Speech.start(ears, lambda text, final: out.append((text, ears.speaker, final)))  # no network
+    ears._parts = []
 
 
-def results(text, final, speaker=0, speech_final=False):
-    words = [{"word": w, "speaker": speaker} for w in text.split()]
-    ears._message({"type": "Results", "is_final": final, "speech_final": speech_final,
-                   "channel": {"alternatives": [{"transcript": text, "words": words}]}})
+    def results(text, final, speaker=0, speech_final=False):
+        words = [{"word": w, "speaker": speaker} for w in text.split()]
+        ears._message({"type": "Results", "is_final": final, "speech_final": speech_final,
+                       "channel": {"alternatives": [{"transcript": text, "words": words}]}})
 
 
-results("", False)                                   # noise: nothing passed on
-results("", True, speech_final=True)                 # audio VAD on silence: nothing
-assert out == [], out
-results("I can do", False)
-results("I can do 1150", True, speech_final=True)    # speech_final must NOT end the turn
-assert all(not f for _, _, f in out), out
-results("with a thirty day return", True, speaker=1)
-ears._message({"type": "UtteranceEnd", "last_word_end": 3.1})
-assert out[-1] == ("I can do 1150 with a thirty day return", 1, True), out[-1]
-n = len(out)
-ears._message({"type": "UtteranceEnd"})              # no new words: no empty turn
-assert len(out) == n
-print("ok")
+    results("", False)                                   # noise: nothing passed on
+    results("", True, speech_final=True)                 # audio VAD on silence: nothing
+    assert out == [], out
+    results("I can do", False)
+    results("I can do 1150", True, speech_final=True)    # speech_final must NOT end the turn
+    assert all(not f for _, _, f in out), out
+    results("with a thirty day return", True, speaker=1)
+    ears._message({"type": "UtteranceEnd", "last_word_end": 3.1})
+    assert out[-1] == ("I can do 1150 with a thirty day return", 1, True), out[-1]
+    n = len(out)
+    ears._message({"type": "UtteranceEnd"})              # no new words: no empty turn
+    assert len(out) == n
+    print("ok")
 
+
+else:
+    print('Speech adapter checks require scripts/setup.sh; running kit-free gesture checks.')
 
 # ---- wave gesture -------------------------------------------------------------------------
 w = bp.WaveDetector(dps=150, swings=5, window_ms=3000)
@@ -177,6 +186,20 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
         green_timer.callback()
         assert fake.audio
 
+        prior = len(sent)
+        prior_leds = len([c for c in fake.calls if c[0] == "led"])
+        bp.ears.pending = "a newer offer invalidates the old green"
+        assert not bp.set_cue("#00ff00", "solid", validate=lambda: len(sent) == prior)
+        assert sent[-1][0] == "a newer offer invalidates the old green"
+        assert len([c for c in fake.calls if c[0] == "led"]) == prior_leds
+        assert fake.audio  # stale cue resumes listening without showing the old colour
+        with patch.object(fake, "set_led", side_effect=RuntimeError("LED command failed")):
+            try:
+                bp.set_cue("#00ff00", "solid")
+                assert False, "LED failure must propagate"
+            except RuntimeError:
+                pass
+        assert fake.audio and bp._resume is None
         bp.ears.pending = "last conversation words"
         def wave(start):
             for i, rate in enumerate([300, -300, 300, -300, 300]):
@@ -219,7 +242,7 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
     assert not fake.audio and fake.calls[-1] == ("off",)
 
     def fail_start(self, callback):
-        raise speech.SpeechError("test connection failure")
+        raise RuntimeError("test connection failure")
 
     with patch.object(FakeEars, "start", fail_start):
         bp.toggle_decisions()
@@ -228,3 +251,42 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
         assert not bp.memory_on and bp.ears is None
 
 print("registered gestures, LEDs, drain and failures ok")
+
+if speech is not None:
+    # Continuous recognized speech is segmented without retaining all past final text.
+    bp.band = None
+    out = []
+    bounded = bp.Diarized()
+    speech.Speech.start(bounded, lambda text, final: out.append((text, final)))
+    bounded._parts = []
+    for _ in range(30):
+        bounded._message({"type": "Results", "is_final": True,
+                          "channel": {"alternatives": [{"transcript": "word " * 400}]}})
+    bounded._sentence_ends()
+    assert bounded.finals == []
+    assert all(len(text.encode("utf-8")) <= bp.MAX_TEXT_BYTES for text, final in out if final)
+    print("speech segmentation and stale cue regression ok")
+
+
+# Failed handoff closes both modes rather than blocking or silently losing future turns.
+bp.band, bp.ears = None, None
+bp.decisions_on, bp.memory_on, bp._capture_failed = True, False, False
+bp.emit = lambda *_: False
+with patch.object(bp.threading, "Thread", ImmediateThread):
+    bp._emit("rejected by full consumer", True)
+assert not bp.decisions_on and not bp.memory_on and bp._capture_failed
+print("bounded consumer failure stops capture ok")
+
+
+if speech is not None:
+    # Test timeout without waiting for a real socket or contacting Deepgram.
+    probe = bp.Diarized()
+    checks = []
+    probe._done = SimpleNamespace(wait=lambda _: False)
+    probe._pending_lock = bp.threading.Lock()
+    probe._pending_sends = {1: bp.time.monotonic() - 10}
+    probe._ws = SimpleNamespace(sock=SimpleNamespace(shutdown=lambda _: checks.append('socket aborted')))
+    with patch.object(bp, '_fail_capture', lambda *args, **kw: checks.append('capture failed')):
+        probe._write_watchdog()
+    assert checks == ['socket aborted', 'capture failed']
+    print('speech write deadline ok')

@@ -1,11 +1,9 @@
 'use client';
 import Link from 'next/link';
-import { useState } from 'react';
 import MemoryCapture from '@/components/MemoryCapture';
 import Conversation from '@/components/Conversation';
 import DecisionCard from '@/components/DecisionCard';
 import GoalsForm from '@/components/GoalsForm';
-import { setSession } from '@/lib/api';
 import { decisionRequest } from '@/lib/memory';
 import { useNames } from '@/lib/names';
 import { selectedTurn, visibleTurns, type Mode, type Session } from '@/lib/store';
@@ -15,13 +13,11 @@ const MIC = { live: '● Mic live', 'cue-hold': 'Mic paused for cue', off: 'Mic 
 
 export default function Live() {
   const { state, dispatch, link } = useBridge();
-  const [offline, setOffline] = useState(false);
   const { session, status } = state;
   const { name } = useNames();
 
-  const save = (next: Session, post: boolean) => {
-    dispatch({ type: 'session', session: next });
-    if (post) setSession(next).then(() => setOffline(false), () => setOffline(true));
+  const save = (next: Session, _post: boolean) => {
+    dispatch({ type: 'session', session: next }); // local goals until the decision component is connected
   };
 
   const sel = selectedTurn(state);
@@ -53,6 +49,12 @@ export default function Live() {
               Decisions {state.decisionsOn ? 'on' : 'off'}
             </span>
           )}
+          {state.context && <span className="chip rec">Recording memory</span>}
+          {state.gesture && (
+            <span key={state.gesture.time_ms} className="chip flash" role="status" aria-live="polite">
+              {state.gesture.name === 'wave' ? 'Wave' : 'Triple tap'} → {state.gesture.name === 'wave' ? 'memory' : 'decisions'} {state.gesture.on ? 'on' : 'off'} · {new Date(state.gesture.time_ms).toLocaleTimeString()}
+            </span>
+          )}
           {!empty && state.decisionsOn !== false && (
             <button className="ghost" title="Keep this conversation in Memory › Past conversations and start a new one"
               onClick={() => dispatch({ type: 'new-conversation' })}>New conversation</button>
@@ -78,7 +80,7 @@ export default function Live() {
             </div>
           ) : empty ? (
             <div className="empty">
-              <h1>What are we deciding?</h1>
+              <h1>Live transcript</h1>
               <p className="muted">
                 {state.decisionsOn
                   ? "Decisions mode is on: start talking. Each speaker's words stream in here as they are spoken."
@@ -93,9 +95,7 @@ export default function Live() {
           <MemoryCapture state={state} />
           <GoalsForm session={session} save={save} />
           <p className="fine">
-            {offline
-              ? 'Orchestrator not reachable: mode and goals are saved in this browser but were not sent.'
-              : 'Listening only counts once your goals are confirmed.'}
+            Speech capture works independently of goals. Memory and goals are saved locally; the decision component is not connected.
           </p>
         </div>
       </section>
@@ -105,7 +105,7 @@ export default function Live() {
           {state.pinned != null && <button className="ghost" onClick={() => dispatch({ type: 'pin', turn_id: null })}>Follow latest</button>}
         </header>
         {sel == null
-          ? <p className="muted">The latest decision shows here: the cue, why, and the facts and memory it used. Click any turn to pin its decision.</p>
+          ? <p className="muted">The decision component is not connected. Live speech and memory capture work independently.</p>
           : <DecisionCard turn={turn} d={d} options={session.lunch_options} />}
         <section>
           <h3>Memory for {request ? `turn ${request.turn.turn_id} · ${request.turn.speaker}` : 'the next turn'}</h3>
