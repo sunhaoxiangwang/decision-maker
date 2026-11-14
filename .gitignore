@@ -1,0 +1,9 @@
+.env
+target/
+vexo-open-kit/
+.venv/
+__pycache__/
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
