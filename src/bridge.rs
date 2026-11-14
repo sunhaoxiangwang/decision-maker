@@ -176,6 +176,7 @@ impl Bridge {
         let (emit_turns, emit_hub) = (turns.clone(), hub.clone());
         let pipeline = Python::with_gil(|py| -> PyResult<Py<PyModule>> {
             let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/pipeline");
+            py.import_bound("site")?.call_method1("addsitedir", (env!("BRIDGE_SITE_PACKAGES"),))?; // venv packages (bleak)
             py.import_bound("sys")?.getattr("path")?.call_method1("insert", (0, dir))?;
             let m = py.import_bound("band_pipeline")?;
             let emit = PyCFunction::new_closure_bound(
