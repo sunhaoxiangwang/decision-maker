@@ -1,5 +1,6 @@
+/target/
+/data/
 .env
-target/
 vexo-open-kit
 .venv*/
 __pycache__/
