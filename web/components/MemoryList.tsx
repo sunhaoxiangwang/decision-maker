@@ -11,7 +11,7 @@ type Props = {
 };
 
 const source = (m: MemoryItem) =>
-  m.source.type === 'user' ? 'typed by you' : `conversation${m.source.turn_ids.length ? ` · t${m.source.turn_ids.join(', t')}` : ''}`;
+  m.source.type === 'user' ? 'from you (typed or spoken)' : `conversation${m.source.turn_ids.length ? ` · t${m.source.turn_ids.join(', t')}` : ''}`;
 
 export default function MemoryList({ items, uses, highlight, onSave, onConfirm, onDelete }: Props) {
   if (items.length === 0) return <p className="muted">Nothing here yet.</p>;

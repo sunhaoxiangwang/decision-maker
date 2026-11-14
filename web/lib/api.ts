@@ -3,7 +3,7 @@
 //   through the /api rewrite in next.config.mjs; they throw when it isn't there.
 // - extractMemory: this app's own server route, app/llm/memory/route.ts (OpenAI).
 import { MEMORY_KINDS, type MemoryItem, type MemorySource, type Session } from './store';
-import type { DecisionMemory } from './memory';
+import { words, type DecisionMemory } from './memory';
 
 const post = (url: string, body: unknown) =>
   fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -17,6 +17,21 @@ export async function setSession(session: Session): Promise<void> {
 export async function syncMemory(memories: DecisionMemory[]): Promise<void> {
   const r = await post('/api/memory', { memories });
   if (!r.ok) throw new Error(`orchestrator answered ${r.status}`);
+}
+
+/** Notes from text the user gave (typed, or spoken after a wave). With no model, one note
+ *  per line as given, so the user's context is never lost; `warning` says why. */
+export async function rememberContext(text: string): Promise<{ items: MemoryItem[]; warning?: string }> {
+  try {
+    return { items: await extractMemory({ source: 'user', text }) };
+  } catch (e) {
+    const now = Date.now();
+    const items: MemoryItem[] = text.split('\n').map((l) => l.trim()).filter(Boolean).map((line) => ({
+      id: crypto.randomUUID(), status: 'confirmed', kind: 'context', subject: 'user', text: line,
+      keywords: [...new Set(words(line))].slice(0, 8), source: { type: 'user' }, saved_ms: now,
+    }));
+    return { items, warning: `Saved as given, one note per line. (${(e as Error).message})` };
+  }
 }
 
 type Extracted = { kind: string; subject: string; text: string; keywords: string[]; turn_ids: number[] };

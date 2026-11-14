@@ -4,7 +4,7 @@
 //!   cargo run -- --band <team band number>         live listening, no taps
 //!   cargo run -- --typed                           TYPED input, no band
 //!   add --cue to answer every final turn with an Ask cue (tests the LED path)
-use decision_maker::bridge::{Bridge, Cue};
+use decision_maker::bridge::{Bridge, Cue, Purpose};
 use std::time::Instant;
 
 fn main() {
@@ -26,10 +26,10 @@ fn main() {
     while let Some(t) = bridge.next_transcript() {
         let queued = t.received.elapsed().as_micros();
         println!(
-            "{label} turn {} speaker {:?} final={} ({queued} µs in bridge): {}",
-            t.turn_id, t.speaker, t.is_final, t.text
+            "{label} conversation {} turn {} speaker {:?} final={} {:?} ({queued} µs in bridge): {}",
+            t.conversation, t.turn_id, t.speaker, t.is_final, t.purpose, t.text
         );
-        if cue && t.is_final {
+        if cue && t.is_final && t.purpose == Purpose::Conversation {
             let start = Instant::now();
             let shown = bridge.show(t.turn_id, Cue::Ask);
             println!("  cue Ask -> {shown:?} in {} ms", start.elapsed().as_millis());

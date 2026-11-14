@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -21,12 +21,37 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone)]
 pub struct Transcript {
     pub turn_id: u64,
+    /// Which decisions-mode session this belongs to: goes up by one each time the user
+    /// triple-taps decisions mode on. A new number = a new conversation (and Deepgram's
+    /// speaker numbers start again).
+    pub conversation: u64,
     /// Deepgram's diarization label, 0-based.
     pub speaker: Option<u32>,
     pub text: String,
     pub is_final: bool,
+    /// Context = the user's spoken update after the wave gesture: confirm it in the UI and
+    /// use it as memory; do not decide on it.
+    pub purpose: Purpose,
     /// When the bridge received it from Python (for latency measurement).
     pub received: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Purpose {
+    Conversation,
+    Context,
+}
+
+impl Purpose {
+    fn from_py(s: Option<&str>) -> Purpose {
+        if s == Some("context") { Purpose::Context } else { Purpose::Conversation }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Purpose::Conversation => "conversation",
+            Purpose::Context => "context",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -74,7 +99,7 @@ impl Turns {
 /// Server-Sent Events for the UI: `new EventSource("http://127.0.0.1:8787/events")`.
 /// Every event is one JSON object with a "type" field.
 #[derive(Default)]
-struct Hub(Mutex<Vec<TcpStream>>);
+struct Hub(Mutex<Vec<TcpStream>>, Mutex<Option<String>>); // clients; the last `mode` event
 
 impl Hub {
     /// Transcripts are private conversation: only `ui_origin` (the Next.js app) may read them
@@ -95,7 +120,11 @@ impl Hub {
                      Access-Control-Allow-Origin: {ui_origin}\r\nVary: Origin\r\nConnection: keep-alive\r\n\r\n"
                 );
                 if stream.write_all(head.as_bytes()).is_ok() {
-                    self.0.lock().unwrap().push(stream);
+                    // A UI that connects late learns the current mode at once.
+                    let mode = self.1.lock().unwrap().clone();
+                    if mode.map_or(true, |m| stream.write_all(format!("data: {m}\n\n").as_bytes()).is_ok()) {
+                        self.0.lock().unwrap().push(stream);
+                    }
                 }
             }
         });
@@ -146,15 +175,18 @@ fn now_ms() -> u128 {
 fn transcript_json(t: &Transcript) -> String {
     let speaker = t.speaker.map_or("null".to_string(), |s| s.to_string());
     format!(
-        r#"{{"type":"transcript","turn_id":{},"speaker":{speaker},"text":{},"final":{},"time_ms":{}}}"#,
+        r#"{{"type":"transcript","turn_id":{},"conversation":{},"speaker":{speaker},"text":{},"final":{},"purpose":"{}","time_ms":{}}}"#,
         t.turn_id,
+        t.conversation,
         json_str(&t.text),
         t.is_final,
+        t.purpose.as_str(),
         now_ms()
     )
 }
 
 pub struct Bridge {
+    decisions: Arc<AtomicBool>,
     rx: Receiver<Transcript>,
     turns: Arc<Turns>,
     hub: Arc<Hub>,
@@ -173,7 +205,10 @@ impl Bridge {
 
         let (tx, rx) = channel();
         let turns = Arc::new(Turns::default());
-        let (emit_turns, emit_hub) = (turns.clone(), hub.clone());
+        let (emit_turns, emit_hub, publish_hub, mode_hub) = (turns.clone(), hub.clone(), hub.clone(), hub.clone());
+        let decisions = Arc::new(AtomicBool::new(false)); // off until the user triple-taps
+        let conversation = Arc::new(AtomicU64::new(0));
+        let (mode_on, mode_conv, emit_conv) = (decisions.clone(), conversation.clone(), conversation.clone());
         let pipeline = Python::with_gil(|py| -> PyResult<Py<PyModule>> {
             let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/pipeline");
             py.import_bound("site")?.call_method1("addsitedir", (env!("BRIDGE_SITE_PACKAGES"),))?; // venv packages (bleak)
@@ -184,12 +219,20 @@ impl Bridge {
                 None,
                 None,
                 move |args: &Bound<'_, PyTuple>, _kw: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
-                    let (text, speaker, is_final): (String, Option<u32>, bool) = args.extract()?;
+                    let (text, speaker, is_final, purpose): (String, Option<u32>, bool, Option<String>) =
+                        if args.len() == 3 {
+                            let (a, b, c) = args.extract()?;
+                            (a, b, c, None)
+                        } else {
+                            args.extract()?
+                        };
                     let t = Transcript {
                         turn_id: emit_turns.assign(is_final),
+                        conversation: emit_conv.load(SeqCst),
                         speaker,
                         text,
                         is_final,
+                        purpose: Purpose::from_py(purpose.as_deref()),
                         received: Instant::now(),
                     };
                     emit_hub.send(&transcript_json(&t));
@@ -198,6 +241,34 @@ impl Bridge {
                 },
             )?;
             m.setattr("emit", emit)?;
+            // Python's own UI events (the wave gesture): JSON it built with json.dumps.
+            let publish = PyCFunction::new_closure_bound(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>, _kw: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
+                    let (json,): (String,) = args.extract()?;
+                    publish_hub.send(&json);
+                    Ok(())
+                },
+            )?;
+            m.setattr("publish", publish)?;
+            // The handoff after Python saw a triple tap: decisions mode on or off.
+            let set_mode = PyCFunction::new_closure_bound(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>, _kw: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
+                    let (on,): (bool,) = args.extract()?;
+                    let n = if on { mode_conv.fetch_add(1, SeqCst) + 1 } else { mode_conv.load(SeqCst) };
+                    mode_on.store(on, SeqCst);
+                    let json = format!(r#"{{"type":"mode","decisions":{on},"conversation":{n},"time_ms":{}}}"#, now_ms());
+                    *mode_hub.1.lock().unwrap() = Some(json.clone());
+                    mode_hub.send(&json);
+                    Ok(())
+                },
+            )?;
+            m.setattr("set_mode", set_mode)?;
             Ok(m.unbind())
         })
         .map_err(|e| e.to_string())?;
@@ -212,7 +283,7 @@ impl Bridge {
                 let _ = m.delattr("emit"); // drops the sender: next_transcript() returns None
             })
         });
-        Ok(Bridge { rx, turns, hub, pipeline })
+        Ok(Bridge { decisions, rx, turns, hub, pipeline })
     }
 
     /// Blocks for the next transcript (interim and final), passed on as the pipeline
@@ -221,10 +292,10 @@ impl Bridge {
         self.rx.recv().ok()
     }
 
-    /// Shows `cue` on the band for `turn_id`. Ok(false) = stale turn, dropped without
+    /// Shows `cue` on the band for `turn_id`. Ok(false) = stale turn or decisions mode off, dropped without
     /// touching the band. The mic pauses while the light shows, then resumes by itself.
     pub fn show(&self, turn_id: u64, cue: Cue) -> Result<bool, String> {
-        let shown = self.turns.is_latest(turn_id);
+        let shown = self.decisions_on() && self.turns.is_latest(turn_id);
         self.hub.send(&format!(
             r#"{{"type":"cue","turn_id":{turn_id},"cue":{},"shown":{shown},"time_ms":{}}}"#,
             json_str(&format!("{cue:?}")),
@@ -248,6 +319,12 @@ impl Bridge {
 
     /// Sends any JSON object of the orchestrator's (decision reasons, memory updates) to the
     /// UI on the same event stream. Give it a "type" field.
+    /// True while the user has decisions mode on (triple tap). Off: no transcripts arrive and
+    /// `show` sends nothing to the band.
+    pub fn decisions_on(&self) -> bool {
+        self.decisions.load(SeqCst)
+    }
+
     pub fn publish(&self, json: &str) {
         self.hub.send(json);
     }

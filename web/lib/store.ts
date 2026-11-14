@@ -8,7 +8,11 @@ export type Option = 'A' | 'B' | 'C';
 export type TranscriptEvent = {
   type: 'transcript'; turn_id: number; speaker: number | null; // 0-based: display speaker + 1
   text: string; final: boolean; time_ms: number;
+  purpose?: 'conversation' | 'context'; // context = the user's spoken update after a wave gesture
 };
+export type GestureEvent = { type: 'gesture'; name: 'wave'; time_ms: number };
+// Triple tap on the band. On: a new conversation opens. Off: nothing is heard or saved.
+export type ModeEvent = { type: 'mode'; decisions: boolean; conversation: number; time_ms: number };
 export type CueEvent = { type: 'cue'; turn_id: number; cue: Cue; shown: boolean; time_ms: number };
 export type MemoryRef = { id: string; text: string; retrieved_ms: number }; // the memory a decision used
 export type DecisionEvent = {
@@ -42,8 +46,11 @@ export type ConversationTurn = { turn_id: number; speaker: number | null; text: 
 export type Conversation = { id: string; started_ms: number; mode: Mode; turns: ConversationTurn[]; extracted_ms?: number };
 export type MemoryEvent = { type: 'memory'; op: 'proposed' | 'confirmed' | 'updated' | 'deleted'; item: MemoryItem };
 export type StatusEvent = { type: 'status'; band: 'connected' | 'reconnecting' | 'off'; mic: 'live' | 'cue-hold' | 'off' };
-export type BridgeEvent = TranscriptEvent | CueEvent | DecisionEvent | MemoryEvent | StatusEvent;
-export const BRIDGE_EVENTS = new Set(['transcript', 'cue', 'decision', 'memory', 'status']);
+export type BridgeEvent = TranscriptEvent | CueEvent | DecisionEvent | MemoryEvent | StatusEvent | GestureEvent | ModeEvent;
+export const BRIDGE_EVENTS = new Set(['transcript', 'cue', 'decision', 'memory', 'status', 'gesture', 'mode']);
+
+// Spoken context after a wave: waits here until the user confirms or discards it.
+export type PendingContext = { listening: boolean; text: string; interim: string; turn_ids: number[]; time_ms: number };
 
 export type Session = {
   mode: Mode;
@@ -66,6 +73,8 @@ export type State = {
   memory: Record<string, MemoryItem>;
   conversations: Record<string, Conversation>;
   current: string | null; // conversation that new speech joins; null = the next speech starts one
+  context: PendingContext | null;
+  decisionsOn: boolean | null; // null = the bridge has not said (not connected yet)
   status: { band: StatusEvent['band']; mic: StatusEvent['mic'] } | null; // null = never reported
   session: Session;
   latest: number | null; // turn of the newest cue or decision
@@ -81,13 +90,15 @@ export type Action =
   | { type: 'forget-decisions' }
   | { type: 'new-conversation' }
   | { type: 'extracted'; id: string; time_ms: number }
-  | { type: 'delete-conversation'; id: string };
+  | { type: 'delete-conversation'; id: string }
+  | { type: 'context-done' }
+  | { type: 'replace-user-memory'; items: MemoryItem[] };
 
 // What is kept in this browser's localStorage between visits.
 export type Saved = Pick<State, 'decisions' | 'memory' | 'session' | 'conversations' | 'current'>;
 
 export const initial: State = {
-  turns: {}, decisions: {}, memory: {}, conversations: {}, current: null, status: null,
+  turns: {}, decisions: {}, memory: {}, conversations: {}, current: null, context: null, decisionsOn: null, status: null,
   session: { mode: 'negotiation', goals: [] },
   latest: null, pinned: null, loaded: false,
 };
@@ -107,6 +118,7 @@ const turnOf = (s: State, turn_id: number, time_ms: number): Turn =>
 export function reducer(s: State, a: Action): State {
   switch (a.type) {
     case 'transcript': {
+      if (a.purpose === 'context') return heardContext(s, a);
       if (a.final && a.text) return keep(s, a);
       const prev = s.turns[a.turn_id];
       if (prev?.final && !a.final) return s; // interim never overwrites the final text
@@ -134,6 +146,24 @@ export function reducer(s: State, a: Action): State {
     case 'memory': {
       const { [a.item.id]: _, ...rest } = s.memory;
       return { ...s, memory: a.op === 'deleted' ? rest : { ...rest, [a.item.id]: a.item } };
+    }
+    case 'mode': {
+      if (s.decisionsOn === a.decisions && (!a.decisions || s.current)) return { ...s, decisionsOn: a.decisions }; // replayed on reconnect
+      // Off: the conversation ends (dropped if nobody spoke). On: a new one opens, the screen clears.
+      const conv = s.current ? s.conversations[s.current] : undefined;
+      const { [conv?.id ?? '']: empty, ...others } = s.conversations;
+      const conversations = conv && conv.turns.length === 0 ? others : s.conversations;
+      if (!a.decisions) return { ...s, decisionsOn: false, current: null, context: null, conversations };
+      const c: Conversation = { id: `c${a.time_ms}-m${a.conversation}`, started_ms: a.time_ms, mode: s.session.mode, turns: [] };
+      return { ...s, decisionsOn: true, current: c.id, conversations: { ...conversations, [c.id]: c }, turns: {}, latest: null, pinned: null, context: null };
+    }
+    case 'gesture':
+      return { ...s, context: { listening: true, text: s.context?.text ?? '', interim: '', turn_ids: s.context?.turn_ids ?? [], time_ms: a.time_ms } };
+    case 'context-done':
+      return { ...s, context: null };
+    case 'replace-user-memory': { // the user's own context notes give way to the new ones
+      const kept = Object.values(s.memory).filter((m) => !(m.status === 'confirmed' && m.source.type === 'user'));
+      return { ...s, memory: Object.fromEntries([...kept, ...a.items].map((m) => [m.id, m])) };
     }
     case 'status':
       return { ...s, status: { band: a.band, mic: a.mic } };
@@ -168,6 +198,15 @@ export function reducer(s: State, a: Action): State {
     default:
       return s;
   }
+}
+
+// Spoken context never joins the conversation. Interim text previews it; each final turn
+// adds to it (a pause mid-sentence splits it into two turns).
+function heardContext(s: State, a: TranscriptEvent): State {
+  const c = s.context ?? { listening: true, text: '', interim: '', turn_ids: [], time_ms: a.time_ms };
+  if (!a.final) return { ...s, context: { ...c, interim: a.text } };
+  if (!a.text) return s;
+  return { ...s, context: { ...c, listening: false, interim: '', text: `${c.text} ${a.text}`.trim(), turn_ids: [...c.turn_ids, a.turn_id] } };
 }
 
 // A final turn: show it, and keep it in the current conversation. The bridge numbers turns

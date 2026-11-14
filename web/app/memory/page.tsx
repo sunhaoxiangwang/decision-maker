@@ -1,8 +1,8 @@
 'use client';
 import { useEffect, useState } from 'react';
 import MemoryList from '@/components/MemoryList';
-import { extractMemory } from '@/lib/api';
-import { asPrompt, forDecision, transcriptLines, words } from '@/lib/memory';
+import { extractMemory, rememberContext } from '@/lib/api';
+import { asPrompt, forDecision, transcriptLines } from '@/lib/memory';
 import { useNames } from '@/lib/names';
 import { ago, type Conversation, type MemoryEvent, type MemoryItem } from '@/lib/store';
 import { useBridge } from '@/lib/useBridge';
@@ -36,19 +36,9 @@ export default function MemoryPage() {
     if (!text) return;
     setBusy('context');
     setNotice('');
-    try {
-      const notes = await extractMemory({ source: 'user', text });
-      notes.forEach((m) => change('confirmed', m));
-      setNotice(notes.length ? '' : 'Nothing in that text looked worth remembering.');
-    } catch (e) {
-      // No model: keep each line as it was typed, so typed context is never lost.
-      const now = Date.now();
-      text.split('\n').map((l) => l.trim()).filter(Boolean).forEach((line) => change('confirmed', {
-        id: crypto.randomUUID(), status: 'confirmed', kind: 'context', subject: 'user', text: line,
-        keywords: [...new Set(words(line))].slice(0, 8), source: { type: 'user' }, saved_ms: now,
-      }));
-      setNotice(`Saved as typed, one note per line. (${(e as Error).message})`);
-    }
+    const { items, warning } = await rememberContext(text);
+    items.forEach((m) => change('confirmed', m));
+    setNotice(warning ?? (items.length ? '' : 'Nothing in that text looked worth remembering.'));
     form.reset();
     setBusy(null);
   }

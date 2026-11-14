@@ -147,3 +147,8 @@ td.note small { display: block; }
 .conv ul { margin: 0 0 8px 18px; font-size: 14px; }
 .pane section { margin-top: 18px; }
 @media (max-width: 900px) { .context { grid-template-columns: 1fr; } }
+
+/* Wave gesture: spoken context waiting for confirmation */
+.context-confirm { display: grid; gap: 8px; margin-bottom: 10px; padding: 12px 14px; border-radius: 16px; border: 1px solid var(--purple); background: color-mix(in srgb, var(--purple) 8%, transparent); }
+.context-confirm .filters { margin: 0; }
+.chip.on { color: var(--green); border-color: var(--green); }

@@ -82,3 +82,38 @@ test('empty interim guesses (silence) draw no turn', () => {
   s = run([say(1, 'hello', true), say(2, '', false)], s);
   assert.deepEqual(visibleTurns(s).map((t) => t.turn_id), [1]);
 });
+
+test('wave → spoken context is held for confirmation, never joins the conversation, then replaces user memory', () => {
+  const say = (turn_id: number, text: string, final: boolean, purpose?: 'context'): Action => ({ type: 'transcript', turn_id, speaker: 0, text, final, time_ms: turn_id, purpose });
+  const mine = { id: 'old', kind: 'context' as const, subject: 'user', text: 'Budget $1,200.', keywords: [], status: 'confirmed' as const, source: { type: 'user' as const }, saved_ms: 1 };
+  const heard = { ...mine, id: 'heard', source: { type: 'conversation' as const, conversation_id: 'c', turn_ids: [1] } };
+  let s = run([
+    { type: 'memory', op: 'confirmed', item: mine }, { type: 'memory', op: 'confirmed', item: heard },
+    say(1, 'hello', true), { type: 'gesture', name: 'wave', time_ms: 2 },
+    say(2, 'budget is now', false, 'context'), say(2, 'Budget is now $1,300', true, 'context'), say(3, 'and white glove delivery', true, 'context'),
+  ]);
+  assert.deepEqual([s.context?.listening, s.context?.text, s.context?.turn_ids], [false, 'Budget is now $1,300 and white glove delivery', [2, 3]]);
+  assert.deepEqual(visibleTurns(s).map((t) => t.text), ['hello']);
+  assert.equal(s.conversations[s.current!].turns.length, 1);
+  s = run([{ type: 'replace-user-memory', items: [{ ...mine, id: 'new', text: 'Budget is now $1,300.' }] }, { type: 'context-done' }], s);
+  assert.deepEqual(Object.keys(s.memory).sort(), ['heard', 'new']); // typed context replaced, heard memory kept
+  assert.equal(s.context, null);
+});
+
+test('triple tap: on opens a new conversation and clears the screen; off closes it; an empty one is dropped', () => {
+  const say = (turn_id: number, text: string): Action => ({ type: 'transcript', turn_id, speaker: 0, text, final: true, time_ms: 10 + turn_id });
+  const mode = (decisions: boolean, conversation: number, time_ms: number): Action => ({ type: 'mode', decisions, conversation, time_ms });
+  let s = run([mode(true, 1, 1), say(1, 'hello'), say(2, 'I can do $1,150')]);
+  const first = s.current!;
+  assert.equal(s.decisionsOn, true);
+  assert.deepEqual(s.conversations[first].turns.map((t) => t.text), ['hello', 'I can do $1,150']);
+  s = run([mode(false, 1, 20)], s);
+  assert.deepEqual([s.decisionsOn, s.current], [false, null]);
+  s = run([mode(true, 2, 30), say(3, 'second talk')], s);
+  assert.notEqual(s.current, first);
+  assert.deepEqual(visibleTurns(s).map((t) => t.text), ['second talk']);  // screen cleared
+  s = run([mode(true, 2, 30)], s);                                          // replayed on reconnect: no new conversation
+  assert.equal(s.conversations[s.current!].turns.length, 1);
+  s = run([mode(false, 2, 40), mode(true, 3, 50), mode(false, 3, 60)], s); // nobody spoke in 3
+  assert.equal(Object.keys(s.conversations).length, 2);
+});

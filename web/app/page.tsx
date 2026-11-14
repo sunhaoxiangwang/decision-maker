@@ -1,6 +1,7 @@
 'use client';
 import Link from 'next/link';
 import { useState } from 'react';
+import ContextConfirm from '@/components/ContextConfirm';
 import Conversation from '@/components/Conversation';
 import DecisionCard from '@/components/DecisionCard';
 import GoalsForm from '@/components/GoalsForm';
@@ -47,7 +48,12 @@ export default function Live() {
           </select>
           <span className="chip">{goalsOk ? 'Goals ✓' : 'Goals not confirmed'}</span>
           <span className={`chip${status?.mic === 'live' ? ' rec' : ''}`}>{status ? MIC[status.mic] : 'Mic unknown'}</span>
-          {!empty && (
+          {state.decisionsOn !== null && (
+            <span className={`chip${state.decisionsOn ? ' on' : ''}`} title="Triple-tap the band to switch">
+              Decisions {state.decisionsOn ? 'on' : 'off'}
+            </span>
+          )}
+          {!empty && state.decisionsOn !== false && (
             <button className="ghost" title="Keep this conversation in Memory › Past conversations and start a new one"
               onClick={() => dispatch({ type: 'new-conversation' })}>New conversation</button>
           )}
@@ -60,12 +66,22 @@ export default function Live() {
           </div>
         )}
         <div className="thread">
-          {empty ? (
+          {state.decisionsOn === false ? (
+            <div className="empty">
+              <h1>Decisions mode is off</h1>
+              <p className="muted">
+                Triple-tap the band to start. It blinks green five times, then listens: a new conversation opens here
+                and each speaker&apos;s words stream in. Triple-tap again to stop (red five times); nothing is heard or saved while it&apos;s off.
+                Past conversations are in <Link href="/memory">Memory</Link>.
+              </p>
+            </div>
+          ) : empty ? (
             <div className="empty">
               <h1>What are we deciding?</h1>
               <p className="muted">
-                Set your goals below, start the bridge with <code>cargo run -- --band &lt;band number&gt;</code> and
-                start talking. Each speaker's words stream in here as they are spoken.
+                {state.decisionsOn
+                  ? "Decisions mode is on: start talking. Each speaker's words stream in here as they are spoken."
+                  : <>Start the bridge with <code>cargo run -- --band &lt;band number&gt;</code>, then triple-tap the band to start decisions mode.</>}
               </p>
             </div>
           ) : (
@@ -73,6 +89,7 @@ export default function Live() {
           )}
         </div>
         <div className="dock">
+          <ContextConfirm state={state} dispatch={dispatch} />
           <GoalsForm session={session} save={save} />
           <p className="fine">
             {offline
