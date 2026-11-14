@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import type { ReactNode } from 'react';
-import { ago, type DecisionEvent, type Option, type Session, type Turn } from '@/lib/store';
+import { ago, type Decision, type Option, type Session, type Turn } from '@/lib/store';
 import CueBadge, { CUES, Dot } from './CueBadge';
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
@@ -12,10 +12,10 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-export default function DecisionCard({ turn, d, options }: { turn?: Turn; d?: DecisionEvent; options?: Session['lunch_options'] }) {
+export default function DecisionCard({ turn, d, options }: { turn?: Turn; d?: Decision; options?: Session['lunch_options'] }) {
   const cue = turn?.cue ?? d?.cue;
   if (!cue) return <p className="muted">No decision for this turn yet.</p>;
-  const late = turn?.shown === false;
+  const late = (turn?.shown ?? d?.shown) === false;
   return (
     <div className="card">
       <CueBadge cue={cue} late={late} big />

@@ -3,8 +3,8 @@ import { useState } from 'react';
 import Conversation from '@/components/Conversation';
 import DecisionCard from '@/components/DecisionCard';
 import GoalsForm from '@/components/GoalsForm';
-import { api } from '@/lib/api';
-import { selectedTurn, type Mode, type Session } from '@/lib/store';
+import { setSession } from '@/lib/api';
+import { selectedTurn, visibleTurns, type Mode, type Session } from '@/lib/store';
 import { useBridge } from '@/lib/useBridge';
 
 const MIC = { live: '● Mic live', 'cue-hold': 'Mic paused for cue', off: 'Mic off' } as const;
@@ -12,18 +12,18 @@ const MIC = { live: '● Mic live', 'cue-hold': 'Mic paused for cue', off: 'Mic 
 export default function Live() {
   const { state, dispatch, link } = useBridge();
   const [offline, setOffline] = useState(false);
-  const { session, status, mock } = state;
+  const { session, status } = state;
 
   const save = (next: Session, post: boolean) => {
     dispatch({ type: 'session', session: next });
-    if (post) api.setSession(next).then(() => setOffline(false), () => setOffline(true));
+    if (post) setSession(next).then(() => setOffline(false), () => setOffline(true));
   };
 
   const sel = selectedTurn(state);
   const turn = sel == null ? undefined : state.turns[sel];
   const d = turn?.decisionId ? state.decisions[turn.decisionId] : undefined;
   const goalsOk = session.goals.length > 0 && session.goals.every((g) => g.confirmed);
-  const empty = Object.keys(state.turns).length === 0;
+  const empty = visibleTurns(state).length === 0;
   // Safety rule: always disclose a live mic. If nobody has reported the mic state but the
   // bridge is up, assume it is live.
   const micUnknown = !status && link === 'open';
@@ -38,7 +38,6 @@ export default function Live() {
           </select>
           <span className="chip">{goalsOk ? 'Goals ✓' : 'Goals not confirmed'}</span>
           <span className={`chip${status?.mic === 'live' ? ' rec' : ''}`}>{status ? MIC[status.mic] : 'Mic unknown'}</span>
-          {mock && <span className="chip mock">Mock data</span>}
         </header>
         {(status?.mic === 'live' || micUnknown) && (
           <div className="banner" role="status">
@@ -52,8 +51,8 @@ export default function Live() {
             <div className="empty">
               <h1>What are we deciding?</h1>
               <p className="muted">
-                Set your goals below, then start the bridge with <code>cargo run -- --typed --cue</code>.
-                Turns appear here as they are spoken. No bridge yet? Load a mock demo from the sidebar.
+                Set your goals below, start the bridge with <code>cargo run -- --band &lt;band number&gt;</code> and
+                start talking. Each speaker's words stream in here as they are spoken.
               </p>
             </div>
           ) : (
@@ -63,8 +62,8 @@ export default function Live() {
         <div className="dock">
           <GoalsForm session={session} save={save} />
           <p className="fine">
-            {offline && !mock
-              ? 'Orchestrator not reachable: mode and goals are kept in this tab only.'
+            {offline
+              ? 'Orchestrator not reachable: mode and goals are saved in this browser but were not sent.'
               : 'Listening only counts once your goals are confirmed.'}
           </p>
         </div>

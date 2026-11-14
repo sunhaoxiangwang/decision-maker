@@ -41,38 +41,48 @@ export type Turn = {
   cue?: Cue; shown?: boolean; decisionId?: string;
 };
 
+// A decision as kept in this browser: the event, plus what is needed to read it later,
+// when the turns it came from are gone.
+export type Decision = DecisionEvent & { context?: Pick<Turn, 'turn_id' | 'speaker' | 'text'>[]; shown?: boolean };
+
 export type State = {
   turns: Record<number, Turn>;
-  decisions: Record<string, DecisionEvent>;
+  decisions: Record<string, Decision>;
   memory: Record<string, MemoryItem>;
   status: { band: StatusEvent['band']; mic: StatusEvent['mic'] } | null; // null = never reported
   session: Session;
   latest: number | null; // turn of the newest cue or decision
   pinned: number | null; // turn the user clicked; wins over `latest`
-  mock: boolean;         // fixture data is on screen
+  loaded: boolean;       // saved decisions and memory have been read from this browser
 };
 
 export type Action =
   | BridgeEvent
   | { type: 'pin'; turn_id: number | null }
   | { type: 'session'; session: Session }
-  | { type: 'hydrate'; turns?: Turn[]; decisions?: DecisionEvent[]; memory?: MemoryItem[] }
-  | { type: 'reset'; mock: boolean };
+  | { type: 'load'; saved: Partial<Saved> }
+  | { type: 'forget-decisions' };
+
+// What is kept in this browser's localStorage between visits.
+export type Saved = Pick<State, 'decisions' | 'memory' | 'session'>;
 
 export const initial: State = {
   turns: {}, decisions: {}, memory: {}, status: null,
   session: { mode: 'negotiation', goals: [] },
-  latest: null, pinned: null, mock: false,
+  latest: null, pinned: null, loaded: false,
 };
 
 export const selectedTurn = (s: State) => s.pinned ?? s.latest;
 
+// Turns worth drawing, in order. While nobody speaks, Deepgram keeps sending interim
+// guesses with empty text (the kit passes them on), which would otherwise show as a
+// nameless empty turn at the bottom.
+export const visibleTurns = (s: State) =>
+  Object.values(s.turns).filter((t) => t.text || t.cue || t.decisionId).sort((a, b) => a.turn_id - b.turn_id);
+
 // A cue or decision can arrive for a turn we never saw spoken (after a reload).
 const turnOf = (s: State, turn_id: number, time_ms: number): Turn =>
   s.turns[turn_id] ?? { turn_id, speaker: null, text: '', final: true, time_ms };
-
-const byKey = <T, K extends string | number>(items: T[] | undefined, key: (t: T) => K) =>
-  Object.fromEntries((items ?? []).map((t) => [key(t), t])) as Record<K, T>;
 
 export function reducer(s: State, a: Action): State {
   switch (a.type) {
@@ -82,17 +92,24 @@ export function reducer(s: State, a: Action): State {
       const { type: _, ...t } = a;
       return { ...s, turns: { ...s.turns, [a.turn_id]: { ...prev, ...t } } };
     }
-    case 'cue':
+    case 'cue': {
+      const turn = { ...turnOf(s, a.turn_id, a.time_ms), cue: a.cue, shown: a.shown };
+      const d = turn.decisionId ? s.decisions[turn.decisionId] : undefined;
       return {
         ...s, latest: a.turn_id,
-        turns: { ...s.turns, [a.turn_id]: { ...turnOf(s, a.turn_id, a.time_ms), cue: a.cue, shown: a.shown } },
+        turns: { ...s.turns, [a.turn_id]: turn },
+        decisions: d ? { ...s.decisions, [d.id]: { ...d, shown: a.shown } } : s.decisions, // remember late cues
       };
-    case 'decision':
+    }
+    case 'decision': {
+      const context = visibleTurns(s).filter((t) => t.text && t.turn_id <= a.turn_id).slice(-4)
+        .map(({ turn_id, speaker, text }) => ({ turn_id, speaker, text }));
       return {
         ...s, latest: a.turn_id,
-        decisions: { ...s.decisions, [a.id]: a },
+        decisions: { ...s.decisions, [a.id]: { ...a, context } },
         turns: { ...s.turns, [a.turn_id]: { ...turnOf(s, a.turn_id, a.time_ms), decisionId: a.id } },
       };
+    }
     case 'memory': {
       const { [a.item.id]: _, ...rest } = s.memory;
       return { ...s, memory: a.op === 'deleted' ? rest : { ...rest, [a.item.id]: a.item } };
@@ -103,16 +120,15 @@ export function reducer(s: State, a: Action): State {
       return { ...s, pinned: a.turn_id };
     case 'session':
       return { ...s, session: a.session };
-    case 'hydrate': { // fills gaps after a reconnect; anything already seen live wins
-      const turns = { ...byKey(a.turns, (t) => t.turn_id), ...s.turns };
-      const decisions = { ...byKey(a.decisions, (d) => d.id), ...s.decisions };
-      for (const d of Object.values(decisions)) {
-        if (turns[d.turn_id] && !turns[d.turn_id].decisionId) turns[d.turn_id] = { ...turns[d.turn_id], decisionId: d.id };
-      }
-      return { ...s, turns, decisions, memory: { ...byKey(a.memory, (m) => m.id), ...s.memory } };
-    }
-    case 'reset':
-      return { ...initial, mock: a.mock };
+    case 'load': // anything that already arrived live wins over the saved copy
+      return {
+        ...s, loaded: true,
+        decisions: { ...a.saved.decisions, ...s.decisions },
+        memory: { ...a.saved.memory, ...s.memory },
+        session: a.saved.session ?? s.session,
+      };
+    case 'forget-decisions':
+      return { ...s, decisions: {}, turns: Object.fromEntries(Object.entries(s.turns).map(([id, { decisionId: _, ...t }]) => [id, t])) };
     default:
       return s;
   }

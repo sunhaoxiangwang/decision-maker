@@ -55,7 +55,6 @@ summary { cursor: pointer; margin: 18px 0 8px; color: var(--muted); }
 .topbar select:hover { background: var(--hover); }
 .chip { font-size: 13px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); text-decoration: none; white-space: nowrap; }
 .chip.rec { color: var(--red); border-color: var(--red); }
-.chip.mock { color: var(--text); border-style: dashed; border-color: var(--amber); }
 .banner { margin: 0 16px; padding: 8px 14px; border-radius: 12px; font-size: 14px; border: 1px solid var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
 .thread { flex: 1; overflow: auto; padding: 16px; display: flex; flex-direction: column; }
 .col, .dock, .empty { width: 100%; max-width: 768px; margin-inline: auto; }
@@ -130,3 +129,10 @@ td .ghost { padding-left: 0; }
 }
 td:has(> .ghost), td:last-child { white-space: nowrap; }
 .actions .ghost { margin-left: 6px; }
+
+/* Live speech: a pulsing dot while a turn is still being spoken; same-speaker turns sit together */
+.bubble.interim::after { content: ''; display: inline-block; width: 9px; height: 9px; margin-left: 8px; border-radius: 50%; background: currentColor; animation: speaking 1s ease-in-out infinite; }
+@keyframes speaking { 50% { opacity: .25; transform: scale(.8); } }
+@media (prefers-reduced-motion: reduce) { .bubble.interim::after { animation: none; } }
+.turn.grouped { margin-top: -10px; }
+.filters.add { margin-top: 12px; }
