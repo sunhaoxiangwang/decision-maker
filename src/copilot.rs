@@ -35,6 +35,21 @@ impl Copilot {
         self.request("POST", &format!("/v1/sessions/{sid}/turns"), Some(&body))
     }
 
+    /// Submits one final transcript captured between waves as a voice context update. The
+    /// result is never actionable: the proposal is confirmed (or discarded) in the copilot UI.
+    /// `source_seq` shares the turn counter, so turns and updates stay strictly ordered.
+    pub fn context_update(&self, turn_id: u64, text: &str) -> Result<Value, String> {
+        let active = self.request("GET", "/v1/sessions/active", None)?;
+        let sid = active["session_id"].as_str().ok_or("no active copilot session: start one in the copilot UI")?;
+        let body = json!({
+            "protocol": "vexo-copilot/1", "session_id": sid, "mode": active["mode"],
+            "source_id": "cy-bridge", "update_id": format!("{}-ctx-{turn_id}", self.boot),
+            "source_seq": turn_id, "trigger": "three_waves",
+            "transcript": {"text": text, "transcript_source": "deepgram"},
+        });
+        self.request("POST", &format!("/v1/sessions/{sid}/context-updates"), Some(&body))
+    }
+
     // ponytail: one blocking HTTP/1.1 request per call, loopback only; no keep-alive, no
     // cue long-poll yet (confirmation-wait cues arrive on the next turn), add when needed.
     fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {

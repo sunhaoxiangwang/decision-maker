@@ -48,6 +48,12 @@ fn main() {
                 }
                 Err(e) => eprintln!("  {e}"),
             }
+        } else if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Context) {
+            // goal update spoken between waves: proposal only, never an LED cue
+            match c.context_update(t.turn_id, &t.text) {
+                Ok(r) => println!("  context update {} -> {} (confirm in the copilot UI)", r["update"]["update_id"], r["status"]),
+                Err(e) => eprintln!("  {e}"),
+            }
         } else if cue && t.is_final && t.purpose == Purpose::Conversation {
             let start = Instant::now();
             let shown = bridge.show(&t, Cue::Ask);
