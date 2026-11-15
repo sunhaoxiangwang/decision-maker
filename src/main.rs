@@ -1,10 +1,12 @@
 //! Bridge demo: prints every transcript with its turn and bridge latency. The UI gets the
-//! same stream at http://127.0.0.1:8787/events. The orchestrator calls the same
+//! same stream at http://127.0.0.1:8790/events. With COPILOT_BRIDGE_TOKEN set, each
+//! final conversation turn goes to the copilot server (docs/contract-v1.md) and its cue is shown. The orchestrator calls the same
 //! `next_transcript` / `show` / `publish`.
 //!   cargo run -- --band <team band number>         triple tap to listen
 //!   cargo run -- --typed                           TYPED input, no band
 //!   add --cue to answer every final turn with an Ask cue (tests the LED path)
 use decision_maker::bridge::{Bridge, Cue, Purpose};
+use decision_maker::copilot::{self, Copilot};
 use std::time::Instant;
 
 fn main() {
@@ -23,16 +25,37 @@ fn main() {
         eprintln!("bridge failed to start: {e}");
         std::process::exit(1)
     });
+    let copilot = Copilot::from_env();
+    if copilot.is_none() {
+        eprintln!("COPILOT_BRIDGE_TOKEN not set: transcripts are not sent to the copilot server.");
+    }
     while let Some(t) = bridge.next_transcript() {
         let queued = t.received.elapsed().as_micros();
         println!(
             "{label} conversation {} turn {} speaker {:?} final={} {:?} ({queued} µs in bridge): {}",
             t.conversation, t.turn_id, t.speaker, t.is_final, t.purpose, t.text
         );
-        if cue && t.is_final && t.purpose == Purpose::Conversation {
+        if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Conversation) {
+            match c.submit(t.turn_id, &t.text, t.speaker) {
+                Ok(result) => {
+                    let snap = &result["snapshot"];
+                    if let Some(ev) = copilot::decision_event(t.turn_id, snap, now_ms()) {
+                        let _ = bridge.publish(&ev); // UI only; the LED below does not depend on it
+                    }
+                    if let Some(cue) = copilot::cue_of(snap) {
+                        println!("  copilot {} -> {:?}", snap["outcome"], bridge.show(&t, cue));
+                    }
+                }
+                Err(e) => eprintln!("  {e}"),
+            }
+        } else if cue && t.is_final && t.purpose == Purpose::Conversation {
             let start = Instant::now();
             let shown = bridge.show(&t, Cue::Ask);
             println!("  cue Ask -> {shown:?} in {} ms", start.elapsed().as_millis());
         }
     }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
 }

@@ -71,9 +71,9 @@ impl Cue {
         match self {
             Cue::Proceed => Some(("#00ff00", "solid")),
             Cue::Pause => Some(("#ff0000", "blink")),
-            Cue::Ask => Some(("#ffbf00", "breathe")),
+            Cue::Ask => Some(("#ffb000", "blink")), // colours: docs/contract-v1.md
             Cue::Lunch('A') => Some(("#00ff00", "solid")),
-            Cue::Lunch('B') => Some(("#aa00ff", "solid")),
+            Cue::Lunch('B') => Some(("#8000ff", "solid")),
             Cue::Lunch('C') => Some(("#ffffff", "solid")),
             Cue::Lunch(_) | Cue::Off => None,
         }
@@ -144,10 +144,10 @@ pub struct Bridge {
 
 impl Bridge {
     /// `band`: the team's band number (live listening), or None for TYPED input from stdin.
-    /// The UI event stream listens on 127.0.0.1:`BRIDGE_PORT` (default 8787) and answers
+    /// The UI event stream listens on 127.0.0.1:`BRIDGE_PORT` (default 8790; the copilot server owns 8787) and answers
     /// browsers only from `BRIDGE_UI_ORIGIN` (default http://localhost:3000, Next.js dev).
     pub fn start(band: Option<u16>) -> Result<Bridge, String> {
-        let port = std::env::var("BRIDGE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8787);
+        let port = std::env::var("BRIDGE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8790);
         let ui_origin = std::env::var("BRIDGE_UI_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".into());
         let hub = Arc::new(Hub::default());
         hub.send(&format!(r#"{{"type":"mode","decisions":false,"conversation":0,"time_ms":{}}}"#, now_ms()));
@@ -367,8 +367,8 @@ mod tests {
     #[test]
     fn cue_colours() {
         assert_eq!(Cue::Pause.led(), Some(("#ff0000", "blink")));
-        assert_eq!(Cue::Ask.led().unwrap().0, "#ffbf00");
-        assert_eq!(Cue::Lunch('B').led().unwrap().0, "#aa00ff");
+        assert_eq!(Cue::Ask.led(), Some(("#ffb000", "blink")));
+        assert_eq!(Cue::Lunch('B').led().unwrap().0, "#8000ff");
         assert_eq!(Cue::Lunch('C').led().unwrap().0, "#ffffff");
         assert_eq!(Cue::Lunch('D').led(), None);
         assert_eq!(Cue::Off.led(), None);

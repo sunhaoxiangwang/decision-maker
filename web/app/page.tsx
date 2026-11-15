@@ -95,7 +95,7 @@ export default function Live() {
           <MemoryCapture state={state} />
           <GoalsForm session={session} save={save} />
           <p className="fine">
-            Speech capture works independently of goals. Memory and goals are saved locally; the decision component is not connected.
+            Goals, budget changes and memory are confirmed in the copilot UI (http://127.0.0.1:8787/); speech never confirms them.
           </p>
         </div>
       </section>
@@ -105,7 +105,7 @@ export default function Live() {
           {state.pinned != null && <button className="ghost" onClick={() => dispatch({ type: 'pin', turn_id: null })}>Follow latest</button>}
         </header>
         {sel == null
-          ? <p className="muted">The decision component is not connected. Live speech and memory capture work independently.</p>
+          ? <p className="muted">Decisions come from the copilot server for each finished turn. Start a session and confirm goals at http://127.0.0.1:8787/.</p>
           : <DecisionCard turn={turn} d={d} options={session.lunch_options} />}
         <section>
           <h3>Memory for {request ? `turn ${request.turn.turn_id} · ${request.turn.speaker}` : 'the next turn'}</h3>

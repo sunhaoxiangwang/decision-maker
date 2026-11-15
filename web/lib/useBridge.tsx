@@ -10,7 +10,7 @@ import { createContext, useContext, useEffect, useReducer, useRef, useState, typ
 import { readSaved, writeSaved, SAVE_ERROR } from './storage';
 import { BRIDGE_EVENTS, initial, reducer, type Action, type Saved, type State } from './store';
 
-const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? 'http://127.0.0.1:8787/events';
+const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? 'http://127.0.0.1:8790/events';
 
 export type Link = 'connecting' | 'open' | 'down';
 const Ctx = createContext<{ state: State; dispatch: Dispatch<Action>; link: Link; storageError: string | null } | null>(null);

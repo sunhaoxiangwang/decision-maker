@@ -242,7 +242,7 @@ function heardContext(s: State, a: TranscriptEvent): State {
   if (!a.text) return s;
   const text = c.text ? `${c.text}\n${a.text}` : a.text;
   const item: MemoryItem = {
-    id: `wave-${c.time_ms}`, status: 'confirmed', kind: 'context', subject: 'user', text,
+    id: `wave-${c.time_ms}`, status: 'proposed', /* speech never confirms (contract-v1) */ kind: 'context', subject: 'user', text,
     keywords: [], source: { type: 'user' }, saved_ms: a.time_ms,
   };
   return { ...s, context: { ...c, interim: '', text, turn_ids: [...c.turn_ids, a.turn_id] }, memory: { ...s.memory, [item.id]: item } };

@@ -99,7 +99,7 @@ test('wave toggles continuous verbatim memory without confirmation or replacing 
   assert.deepEqual(visibleTurns(s).map((t) => t.text), ['hello']);
   assert.equal(s.conversations[s.current!].turns.length, 1);
   assert.equal(s.memory['wave-20'].text, 'Budget is now $1,300\nand white glove delivery');
-  assert.equal(s.memory['wave-20'].status, 'confirmed');
+  assert.equal(s.memory['wave-20'].status, 'proposed'); // confirm in the UI, never by speech
   assert.equal(s.memory.old, mine);
   s = run([say(3, 'and white glove delivery', true, 'context'), { type: 'gesture', name: 'wave', memory: true, time_ms: 20 }], s);
   assert.equal(s.memory['wave-20'].text, 'Budget is now $1,300\nand white glove delivery'); // no duplicate on replay

@@ -74,7 +74,7 @@ export default function MemoryPage() {
         link.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }}>Export history and memory</button>
-      <p className="muted">Saved in this browser only; the decision component is not connected. Wave to start recording memory; wave again to stop. Spoken memory is saved as the transcript, without summarizing.</p>
+      <p className="muted">Wave to record; wave again to stop. Spoken updates are saved word for word as proposals: confirm them here, and confirm goal or budget changes in the copilot UI (http://127.0.0.1:8787/). Speech never confirms anything.</p>
 
       <form className="context" onSubmit={(e) => { e.preventDefault(); addContext(e.currentTarget); }}>
         <textarea
