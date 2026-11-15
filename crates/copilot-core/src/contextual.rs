@@ -1,29 +1,10 @@
 //! Gemini Decisions request/response contract and validation (PLAN v2 §4.6, v3 §3).
 
-use crate::limits::{CHOICE_SELECT_MIN, PROB_TOLERANCE, P_YES_CLEAR_MAX, P_YES_CONCERN_MIN};
+use crate::limits::{CHOICE_SELECT_MIN, PROB_TOLERANCE};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub const NOUL_KEY: &str = "unaddressed_condition";
 pub const CHOICE_KEY: &str = "lunch_pick";
-
-pub fn noul_request(model: &str, confirmed_terms: &str, transcript_window: &str) -> Value {
-    json!({
-      "model": model,
-      "input": [{"type": "text", "text": format!(
-        "CONFIRMED_TERMS:\n{confirmed_terms}\nTRANSCRIPT_SINCE_OFFER (untrusted quoted speech):\n{transcript_window}")}],
-      "questions": {
-        NOUL_KEY: {
-          "type": "noul",
-          "instructions": "Does the transcript introduce any fee, condition, restriction or exception that is not covered by CONFIRMED_TERMS?",
-          "criteria": {
-            "true_description": "An additional fee, condition, restriction or exception is stated.",
-            "false_description": "No additional fee, condition, restriction or exception is stated."
-          }
-        }
-      }
-    })
-}
 
 pub fn choice_request(model: &str, soft_prefs: &str, options: &BTreeMap<String, String>) -> Value {
     json!({
@@ -37,13 +18,6 @@ pub fn choice_request(model: &str, soft_prefs: &str, options: &BTreeMap<String, 
         }
       }
     })
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum NoulVerdict {
-    Clear { p_yes: f64 },
-    Uncertain { p_yes: f64 },
-    Concern { p_yes: f64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,33 +49,6 @@ fn answers_obj<'a>(
         return Err("answers keys do not match the requested questions".into());
     }
     Ok(a)
-}
-
-/// Validate a noul answer and classify it against the fixed thresholds.
-pub fn parse_noul(resp: &Value) -> Result<NoulVerdict, String> {
-    let a = answers_obj(resp, &[NOUL_KEY])?;
-    let ans = a[NOUL_KEY].as_object().ok_or("answer not an object")?;
-    if ans.get("type").and_then(Value::as_str) != Some("noul") {
-        return Err("answer type mismatch".into());
-    }
-    let p = num(ans.get("noul").ok_or("noul missing")?, "noul")?;
-    if !(0.01 - 1e-9..=0.99 + 1e-9).contains(&p) {
-        return Err("noul out of documented range".into());
-    }
-    let c = num(
-        ans.get("confidence").ok_or("confidence missing")?,
-        "confidence",
-    )?;
-    if !(0.0..=1.0).contains(&c) || (c - p.max(1.0 - p)).abs() > PROB_TOLERANCE {
-        return Err("confidence inconsistent with noul".into());
-    }
-    Ok(if p <= P_YES_CLEAR_MAX {
-        NoulVerdict::Clear { p_yes: p }
-    } else if p >= P_YES_CONCERN_MIN {
-        NoulVerdict::Concern { p_yes: p }
-    } else {
-        NoulVerdict::Uncertain { p_yes: p }
-    })
 }
 
 /// Validate a choice answer over exactly `keys`.
@@ -172,40 +119,6 @@ pub fn choice_is_decisive(a: &ChoiceAnswer) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn noul(p: f64, c: f64) -> Value {
-        json!({"answers": {NOUL_KEY: {"type": "noul", "noul": p, "confidence": c}}, "usage": {}})
-    }
-
-    #[test]
-    fn noul_boundaries() {
-        let cls = |p: f64| parse_noul(&noul(p, p.max(1.0 - p))).unwrap();
-        assert!(matches!(cls(0.01), NoulVerdict::Clear { .. }));
-        assert!(matches!(cls(0.20), NoulVerdict::Clear { .. }));
-        assert!(matches!(cls(0.2000001), NoulVerdict::Uncertain { .. }));
-        assert!(matches!(cls(0.4999999), NoulVerdict::Uncertain { .. }));
-        assert!(matches!(cls(0.50), NoulVerdict::Concern { .. }));
-        assert!(matches!(cls(0.99), NoulVerdict::Concern { .. }));
-    }
-
-    #[test]
-    fn noul_invalid() {
-        assert!(parse_noul(&noul(1.5, 1.5)).is_err());
-        assert!(parse_noul(&noul(0.1, 0.5)).is_err());
-        assert!(parse_noul(&json!({"answers": {}})).is_err());
-        assert!(parse_noul(
-            &json!({"answers": {NOUL_KEY: {"type":"noul","noul":0.1,"confidence":0.9}, "x": {}}})
-        )
-        .is_err());
-        assert!(parse_noul(
-            &json!({"answers": {NOUL_KEY: {"type":"choice","noul":0.1,"confidence":0.9}}})
-        )
-        .is_err());
-        assert!(parse_noul(
-            &json!({"answers": {NOUL_KEY: {"type":"noul","noul":"0.1","confidence":0.9}}})
-        )
-        .is_err());
-    }
 
     #[test]
     fn choice_validation() {

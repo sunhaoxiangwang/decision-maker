@@ -17,7 +17,6 @@ pub const TURN_QUEUE_MAX: usize = 3;
 pub const SESSION_JOB_QUEUE_MAX: usize = 16;
 pub const OFFERS_PER_SESSION: usize = 20;
 pub const TOMBSTONES_PER_SESSION: usize = 100;
-pub const FACTS_PER_OFFER: usize = 32;
 pub const CONDITIONS_PER_OFFER: usize = 16;
 
 pub const EXCERPT_MAX_BYTES: usize = 240;
@@ -46,9 +45,6 @@ pub const MEMORY_PREFS_MAX: usize = 200;
 pub const PREF_TEXT_MAX: usize = 280;
 pub const CORRUPT_FILES_KEPT: usize = 3;
 
-/// Contextual thresholds (uncalibrated defaults; PLAN v2/v3 §4.6).
-pub const P_YES_CLEAR_MAX: f64 = 0.20;
-pub const P_YES_CONCERN_MIN: f64 = 0.50;
 pub const CHOICE_SELECT_MIN: f64 = 0.60;
 pub const PROB_TOLERANCE: f64 = 1e-3;
 

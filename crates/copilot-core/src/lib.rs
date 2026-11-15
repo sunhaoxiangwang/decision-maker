@@ -9,6 +9,6 @@ pub mod distance;
 pub mod limits;
 pub mod lunch;
 pub mod money;
-pub mod negotiation;
+pub mod judge;
 pub mod session;
 pub mod text;

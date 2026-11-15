@@ -1,6 +1,6 @@
 //! replay: SIMULATED bridge + simulated user for scripted demos.
-//! Sends turns through the bridge API (transcript_source "simulated"), confirms
-//! through the session-bound UI forms (X-Copilot-Simulated), applies cues with the
+//! Sends turns through the bridge API (transcript_source "simulated"), sets goals and
+//! confirms lunch facts through the session-bound UI forms (X-Copilot-Simulated), applies cues with the
 //! reference bridge model, and reports latency per generation: from the turn's
 //! submission through the final applied cue, including every confirmation wait.
 
@@ -130,17 +130,12 @@ async fn setup(ctx: &mut Ctx, sc: &Value) {
     ctx.seq = 0;
     let page = ctx.get_text("/").await;
     if ctx.mode == Mode::Negotiation {
-        let g = &sc["goals"];
+        // free-text goals, in the user's own words (optional)
         let gv = scrape(&page, "goals_version").unwrap_or_else(|| "1".into());
+        let goals = sc["goals"].as_str().unwrap_or("").to_string();
         ctx.form(
             "/ui/goals",
-            &[
-                ("goals_version", gv),
-                ("size", g["size"].as_str().unwrap_or("queen").into()),
-                ("firmness", g["firmness"].as_str().unwrap_or("firm").into()),
-                ("budget", g["budget"].as_u64().unwrap_or(1200).to_string()),
-                ("nights", g["nights"].as_u64().unwrap_or(100).to_string()),
-            ],
+            &[("goals_version", gv), ("goals", goals)],
             Some(&page),
         )
         .await;
@@ -225,20 +220,12 @@ async fn confirm_all(ctx: &mut Ctx) -> (u16, Duration) {
     let t = Instant::now();
     let page = ctx.get_text("/confirm").await;
     let human = t.elapsed();
-    let code = match (scrape(&page, "items"), scrape(&page, "offer_id")) {
-        (Some(items), Some(offer)) => {
-            ctx.form(
-                "/ui/confirm",
-                &[("offer_id", offer), ("items", items)],
-                Some(&page),
-            )
-            .await
-        }
-        (Some(items), None) => {
+    let code = match scrape(&page, "items") {
+        Some(items) => {
             ctx.form("/ui/lunch/confirm", &[("items", items)], Some(&page))
                 .await
         }
-        _ => 0,
+        None => 0,
     };
     (code, human)
 }
@@ -255,7 +242,7 @@ fn outcome_str(s: &CueSnapshot) -> String {
 /// against the server's limits. SIMULATED load.
 async fn stress_retention(mut ctx: Ctx) -> i32 {
     let pad: String = std::iter::repeat_n('\u{1F642}', 3300).collect();
-    let sc = json!({"mode": "negotiation", "goals": {}});
+    let sc = json!({"mode": "negotiation", "goals": "under $1,200"});
     for sess in 0..5 {
         setup(&mut ctx, &sc).await;
         for t in 0..64u64 {
@@ -342,12 +329,8 @@ async fn stress_retention(mut ctx: Ctx) -> i32 {
         for key in [
             "turns",
             "transcript_bytes",
-            "archived_offers",
-            "tombstones",
-            "offer_turn_seqs",
+            "goal_updates",
             "snapshot_bytes",
-            "offer_unresolved",
-            "offer_conditions",
             "lunch_unresolved",
         ] {
             let max = sessions

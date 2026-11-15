@@ -58,18 +58,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/ui/close", post(ui::post_close))
         .route("/ui/goals", post(ui::post_goals))
         .route("/ui/turn", post(ui::post_turn))
-        .route("/ui/confirm", post(ui::post_confirm))
-        .route("/ui/condition/resolve", post(ui::post_resolve_condition))
         .route("/ui/turn/discard", post(ui::post_discard))
         .route("/ui/turn/retry", post(ui::post_retry))
         .route("/ui/ambiguous/resolve", post(ui::post_ambiguous))
-        .route("/ui/correct", post(ui::post_correct))
-        .route("/ui/unresolved/dismiss", post(ui::post_unresolved_dismiss))
         .route("/ui/eval/retry", post(ui::post_eval_retry))
-        .route("/ui/context", post(ui::post_context))
-        .route("/ui/context/confirm", post(ui::post_context_confirm))
-        .route("/ui/context/discard", post(ui::post_context_discard))
-        .route("/ui/context/retry", post(ui::post_context_retry))
         .route(
             "/ui/lunch/unresolved/dismiss",
             post(ui::post_lunch_unresolved),
@@ -130,12 +122,11 @@ pub fn providers(mode_mock: bool) -> Result<Providers, String> {
 }
 
 pub async fn check_providers() -> i32 {
-    use copilot_core::contract::Mode;
-    use copilot_providers::{ExtractOutput, ExtractRequest};
+    use copilot_core::contract::Outcome;
     let cfg = match GeminiConfig::from_env() {
         Ok(Some(c)) => c,
         Ok(None) => {
-            println!("gemini-extract   FAIL  missing_credentials (GEMINI_API_KEY not set)");
+            println!("gemini-judge     FAIL  missing_credentials (GEMINI_API_KEY not set)");
             println!("gemini-decisions FAIL  missing_credentials (GEMINI_API_KEY not set)");
             return 2;
         }
@@ -149,74 +140,33 @@ pub async fn check_providers() -> i32 {
         cfg: cfg.clone(),
         client: client.clone(),
     };
-    let t = "The total is $1,150 including delivery, queen, firm, with a 100-night return.";
+    let mut code = 0;
+    // a clear over-budget offer must come back PAUSE
     let t0 = std::time::Instant::now();
     let r = ex
-        .run(ExtractRequest {
-            mode: Mode::Negotiation,
-            transcript: t.into(),
-            active_offer_id: None,
-            active_terms: "none".into(),
-            lunch_options: String::new(),
-        })
+        .judge(
+            "Spend at most $100.".into(),
+            "speaker1: The price is $1,399.".into(),
+        )
         .await;
     let ms = t0.elapsed().as_millis();
-    let mut code = 0;
     match r {
-        Ok(ExtractOutput::Negotiation(e)) => {
-            let stmts: Vec<_> = e
-                .terms
-                .iter()
-                .filter_map(|x| copilot_core::negotiation::validate_term(x, t).ok())
-                .map(|v| v.stmt)
-                .collect();
-            let refs: Vec<_> = stmts.iter().collect();
-            let rr = copilot_core::negotiation::evaluate_requirements(&refs, &Default::default());
-            let pass = rr
-                .all()
-                .iter()
-                .all(|(_, e)| matches!(e, copilot_core::negotiation::Eval::Satisfies(_)));
-            println!(
-                "gemini-extract   {}  {ms} ms  terms={} established={}",
-                if pass { "PASS" } else { "FAIL (validation)" },
-                e.terms.len(),
-                stmts.len()
-            );
-            if !pass {
-                code = 1;
-            }
+        Ok(j) if j.outcome == Outcome::Pause => {
+            println!("gemini-judge     PASS  {ms} ms  PAUSE ({})", j.reason)
         }
-        Ok(_) => {
-            println!("gemini-extract   FAIL  wrong mode");
+        Ok(j) => {
+            println!(
+                "gemini-judge     FAIL  {ms} ms  expected PAUSE, got {:?} ({})",
+                j.outcome, j.reason
+            );
             code = 1;
         }
         Err(e) => {
-            println!("gemini-extract   FAIL  {ms} ms  {}", e.code);
+            println!("gemini-judge     FAIL  {ms} ms  {}", e.code);
             code = 1;
         }
     }
     let dec = GeminiDecider { cfg, client };
-    let t0 = std::time::Instant::now();
-    match dec
-        .noul(
-            "- total $1,150.00 incl. delivery".into(),
-            "The total is $1,150 including delivery.".into(),
-        )
-        .await
-    {
-        Ok(v) => println!(
-            "gemini-decisions PASS  {} ms  noul shape valid ({v:?})",
-            t0.elapsed().as_millis()
-        ),
-        Err(e) => {
-            println!(
-                "gemini-decisions FAIL  {} ms  {}",
-                t0.elapsed().as_millis(),
-                e.code
-            );
-            code = 1;
-        }
-    }
     let t0 = std::time::Instant::now();
     let mut opts = std::collections::BTreeMap::new();
     opts.insert(
@@ -268,7 +218,6 @@ pub async fn spawn(
             data_dir,
             bridge_token,
             providers_label: label.into(),
-            voice_goals_auto: false,
         },
         extractor,
         decider,

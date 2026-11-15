@@ -14,8 +14,8 @@ Turns end on Deepgram's UtteranceEnd: a gap after the last recognised *word*, wo
 the transcript's word timings, so background noise cannot hold a turn open the way it holds
 open the audio silence detector (speech_final, ignored here).
 
-Three waves (THREE_WAVES within THREE_WAVE_WINDOW_MS, any direction) toggle memory capture,
-even with decisions off; one or two waves do nothing. All turns until the next three waves are
+One wave (THREE_WAVES = 1, any direction) starts memory capture, even with decisions off;
+the next wave stops it. All turns until that next wave are
 context, never decisions. The UI saves each finished turn as given, until capture stops. Only
 band context is sent to the copilot as trigger `three_waves`: typed `/wave` simulates the
 gesture and Rust (src/main.rs) does not submit typed context.
@@ -52,7 +52,7 @@ WAVE_DPS = 150           # a swing must turn faster than this (degrees/second)
 WAVE_SWINGS = 5          # left-right three times = L, R, L, R, L: five swings of alternating sign
 WAVE_WINDOW_MS = 3000    # all of them within this long
 WAVE_ACK_S = 0.8         # white flash that says "speak now" (the mic is off while it shows)
-THREE_WAVES = 3          # waves (as WaveDetector counts them, any direction) that toggle memory ...
+THREE_WAVES = 1          # waves (as WaveDetector counts them, any direction) that toggle memory ...
 THREE_WAVE_WINDOW_MS = 8000  # ... first to last within this long. Each wave takes ~1-1.5 s and is
                          # followed by WaveDetector's 1.5 s quiet time, so three deliberate waves
                          # span ~5-6.5 s; 8 s leaves margin while stray waves still expire.
@@ -327,7 +327,7 @@ def toggle_decisions():
 
 
 def on_three_waves():
-    """Three waves (or typed /wave, simulated) start/stop memory capture; drain before each boundary."""
+    """One wave (or typed /wave, simulated) starts/stops memory capture; drain before each boundary."""
     global memory_on, decisions_on, _capture_failed
     with _mode_lock:
         _capture_failed = False
@@ -344,7 +344,7 @@ def on_three_waves():
         elif _start_listening():
             memory_on = True
             set_memory_mode(True)  # noqa: F821
-            print("Memory capture ON: wave three times again to save and stop.")
+            print("Memory capture ON: wave again to save and stop.")
         else:
             if decisions_on:
                 decisions_on = False
@@ -422,7 +422,7 @@ def _watch_gestures(debug=False):
     band.on("reconnecting", lambda _: _status("off", "reconnecting"))
     band.on("reconnected", lambda _: _mic_on() if decisions_on or memory_on else _status("off", "connected"))
     band.on("disconnect", lambda _: _status("off", "off"))
-    band.configure(events=True, motion=50)  # mic stays off until a triple tap or three waves
+    band.configure(events=True, motion=50)  # mic stays off until a triple tap or a wave
     _status("off", "connected")
 
 

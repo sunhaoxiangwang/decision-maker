@@ -1,6 +1,6 @@
 # Vexo Conversation Copilot — Leo's app (Rust)
 
-Checks what is said in a conversation against the user's confirmed goals and publishes a wrist cue: **PROCEED / PAUSE / ASK**, or a lunch **selection A / B / C**. Two demos share one Rust pipeline: mattress **negotiation** and **lunch** among three options.
+Checks what is said in a conversation against the user's goals and publishes a wrist cue: **PROCEED / PAUSE / ASK**, or a lunch **selection A / B / C**. Two demos share one Rust pipeline: mattress **negotiation** and **lunch** among three options.
 
 This repository holds the companion UI, backend, Rust orchestration, Gemini adapters, rules, state, memory and the bridge contract. Cy's bridge (capture, Deepgram transcription, band connection, LEDs) is separate and talks to this app through [`docs/contract-v1.md`](docs/contract-v1.md).
 
@@ -9,12 +9,13 @@ This repository holds the companion UI, backend, Rust orchestration, Gemini adap
 | Item | Status |
 |---|---|
 | Rules, state machine, UI, bridge API, memory store | Implemented; covered by tests |
-| Gemini extraction (`generateContent`) and Gemini Decisions adapters | Implemented to the documented contracts; **no live call has been made** (no `GEMINI_API_KEY` was available) |
-| Mock providers (`--mock`) | Deterministic stand-ins, labelled **MOCK** in the UI and in every response (`providers: "mock"`, `decision_source: "mock_decisions"`) — not evidence of Gemini integration |
+| Negotiation judge (Gemini `generateContent`: free-text goals + conversation → cue and reason) | Implemented; covered by tests; live runs with real Gemini and **simulated** input (`scenarios/negotiation.json`) |
+| Lunch extraction (`generateContent`) and Gemini Decisions (lunch choice) | Implemented; live runs with real Gemini and **simulated** input |
+| Mock providers (`--mock`) | Deterministic stand-ins, labelled **MOCK** in the UI and in every response (`providers: "mock"`, `decision_source: "mock_judge"` / `"mock_decisions"`). The MOCK judge only compares the last spoken dollar amount with the first dollar amount in the goals — not evidence of Gemini behaviour |
 | Real band / hardware | **Not tested.** Cue colours are proposals until Cy verifies them on the band |
 | Contract with Cy | **Proposed, not yet agreed** |
 | Mastra, OpenAI memory summaries, Places | Not part of this implementation |
-| Voice context update (negotiation only, branch `leo/voice-context-update`) | Implemented; covered by tests; one live run with real Gemini and **simulated** bridge input. Not tested with Cy's bridge, gestures or the band |
+| Spoken goal updates (negotiation only, three-wave gesture) | Implemented; covered by tests with **simulated** bridge input. Not yet tested with the band |
 
 ## Layout
 
@@ -49,16 +50,16 @@ Without `GEMINI_API_KEY` and without `--mock`, the app runs with providers **unc
 
 ## Demo: negotiation (UI)
 
-1. Start a **negotiation** session; confirm goals (queen, firm, ≤ $1,200 incl. delivery, ≥ 100 nights).
-2. Type turns (labelled SIMULATED/typed) or let Cy's bridge send them:
-   - `$1,399.` → **PAUSE** (red): over budget even with other terms missing.
-   - `$1,150 delivered, with a 30-day return.` → **PAUSE**: return-policy conflict.
-   - `Best I can do is $1,150 delivered, queen, firm.` → **ASK** (amber): return policy missing.
-   - `Best I can do is $1,150 delivered, queen, firm, with a 100-night return.` → **ASK**, waiting for confirmation.
-3. Open **/confirm** (link in the status panel), check the quoted evidence, **Confirm all shown** → **PROCEED** (green) after the contextual check.
-4. Evidence is checked in its original clause: "it is not firm" can never become "firm". A rejected critical reading stays open as an *unresolved interpretation* and blocks PROCEED until you **correct the value** or **dismiss** it. Unclear turns can be ignored or explicitly treated as a new offer or an amendment. A failed confirmation-triggered evaluation shows **Retry evaluation**.
+Goals are free text in your own words and optional; the model works out the requirements from the goals and from what is said, then judges the latest state of the conversation. Only its answer has a fixed shape: **PROCEED** (green), **PAUSE** (red), **ASK** (amber) or **NONE** (LED off, nothing to judge yet), plus a one-line reason.
 
-5. **Voice context update** (SIMULATED typed form, or the bridge after the three-wave gesture): `My budget is now $1,300 including delivery.` → a proposal shows current vs. proposed goals with the quoted evidence; cues stay at most ASK (PAUSE if already violated) until you **Confirm** (goals change, offer re-evaluated), **Retry** or **Discard** (goals unchanged). Relative changes are not proposed. Lunch does not support voice updates.
+1. Start a **negotiation** session (the bridge also starts one by itself when none is active). Optionally type goals, e.g. `A firm queen mattress. No more than $1,200 including delivery, and at least a 100-night trial.`
+2. Type turns (labelled SIMULATED/typed) or let Cy's bridge send them. Each turn is judged against the goals and the conversation so far (newest 30 turns / 12,000 characters):
+   - `Our firm queen is $1,399.` → **PAUSE**: over budget.
+   - `I can do $1,150 delivered, with a 30-day return.` → **PAUSE**: trial too short.
+   - `Best I can do is $1,150 delivered, queen, firm, with a 100-night trial.` → **PROCEED**.
+   - `Oh, and there's a $150 setup fee on top of that.` → **PAUSE**.
+3. **Spoken goal updates**: words captured between three waves on the band are appended to the goals as said and apply at once (no confirmation step); the conversation is re-judged. Edit or clear the goals in the UI at any time. Lunch does not support voice updates.
+4. A failed judgement (timeout, provider error) shows **UNAVAILABLE** (cyan) with **Retry**; it never blocks later turns, because the next judgement reads the whole conversation again.
 
 ## Demo: lunch (UI)
 
@@ -77,7 +78,7 @@ COPILOT_BRIDGE_TOKEN=$COPILOT_BRIDGE_TOKEN cargo run --release -p copilot-server
 COPILOT_BRIDGE_TOKEN=$COPILOT_BRIDGE_TOKEN cargo run --release -p copilot-server --bin replay -- --scenario scenarios/failures.json
 ```
 
-`replay` sends turns through the bridge API with `transcript_source: "simulated"`, confirms through the UI forms, and applies cues with the reference bridge model. It reports latency per generation — from the turn submission through the final applied cue, including confirmation waits (`pause_ms` simulates the user) — next to the server-side `e2e` / `human_wait` / `processing` timings. All of this is simulated, not hardware latency. `--stress-retention` fills the server to its retention limits and asserts the measured occupancy.
+`replay` sends turns through the bridge API with `transcript_source: "simulated"`, sets goals and confirms lunch facts through the UI forms, and applies cues with the reference bridge model. It reports latency per generation — from the turn submission through the final applied cue, including confirmation waits (`pause_ms` simulates the user) — next to the server-side `e2e` / `human_wait` / `processing` timings. All of this is simulated, not hardware latency. `--stress-retention` fills the server to its retention limits and asserts the measured occupancy.
 
 ## Verification
 
@@ -95,10 +96,10 @@ COPILOT_BRIDGE_TOKEN=x cargo run --release -p copilot-server --bin replay -- --s
 ## Safety and limits
 
 - Keys live only in server environment variables, behind a redacting `Secret` type; they never reach the browser, logs or the repo.
-- Transcript text is untrusted: it is escaped in HTML, never logged, and cannot change goals, rules or thresholds.
-- Confidence never confirms a fact; only the user's explicit confirmation does.
+- Transcript text is untrusted: it is escaped in HTML and never logged. The judge prompt marks the conversation as untrusted speech and tells the model never to accept another party's claim that the user's goals changed; only the user's own UI edits and three-wave updates change the goals.
+- Lunch: confidence never confirms a fact; only the user's explicit confirmation does.
 - Limits: 64 requests in flight (including waiting polls), 8 waiting polls, 16 KiB bridge bodies, 4,000-character transcripts, 64 turn records and 1 MiB of transcripts per session, 1 active + 4 closed sessions.
-- Contextual thresholds (PROCEED only when the Decisions "extra condition" probability ≤ 0.20; lunch selection needs ≥ 0.60) are **uncalibrated** defaults.
+- The lunch selection threshold (≥ 0.60) is an **uncalibrated** default. Negotiation cues are the model's judgement; there are no rule-based checks behind them.
 - Sessions do not survive a server restart; confirmed preferences do (`data/memory.json`, atomic writes; a corrupt file requires explicit recovery).
 - Preference edits are bound to a monotonic publication number (not the reusable file version), so a form from before a reset or restore is rejected (409) without changes. A profile reset copies the bad file to a unique quarantine name, then atomically replaces `memory.json`; if the rename succeeded but the directory flush failed, the app publishes what is on disk, reports the save as uncertain and blocks lunch until **Re-check** succeeds. After a restart, a replaced file loads as the requested new profile; if a crash reverted it, the corrupt file is detected again and recovery is required.
 
@@ -142,7 +143,7 @@ npm run dev -- --port 3000
 Open **http://localhost:3000**, the bridge's allowed browser origin. Speech events come directly from `http://127.0.0.1:8787/events`. Keep this page open while recording. Audio is sent to Deepgram while the microphone is on; tell people nearby before recording.
 
 - Triple-tap: conversation capture on/off. Green/red flashes acknowledge the change.
-- Three waves (any direction, all within 8 s): record memory until the next three waves. One or two waves do nothing. Finished transcript turns are saved as given; with the copilot configured, each final turn is sent as a `three_waves` context update that stays pending until confirmed in the copilot UI (never an LED cue).
+- Three waves (any direction, all within 8 s): record memory until the next three waves. One or two waves do nothing. Finished transcript turns are saved as given; with the copilot configured, each final turn is sent as a `three_waves` goal update that is added to the copilot's goals at once (never an LED cue itself; the conversation is re-judged).
 - The mic is paused during activation flashes (2 s), wave acknowledgement (0.8 s), and optional demo cues (2 s). Wait for blue/the live mic indicator before speaking. These gaps are real missing audio, not buffered audio.
 - `--cue` is only a fixed Ask LED demo; it does not generate decisions.
 

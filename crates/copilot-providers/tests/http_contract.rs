@@ -7,10 +7,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use copilot_core::contextual::NoulVerdict;
-use copilot_core::contract::{ApiError, Mode};
+use copilot_core::contract::{ApiError, Outcome};
+use copilot_core::judge::Judgment;
 use copilot_providers::{
-    Decider, ExtractOutput, ExtractRequest, GeminiConfig, GeminiDecider, GeminiExtractor, Secret,
+    Decider, ExtractRequest, Extractor, GeminiConfig, GeminiDecider, GeminiExtractor, Secret,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -97,34 +97,28 @@ fn cfg(base: &str) -> GeminiConfig {
     }
 }
 
-fn req() -> ExtractRequest {
-    ExtractRequest {
-        mode: Mode::Negotiation,
-        transcript: "Best I can do is $1,150 delivered.".into(),
-        active_offer_id: None,
-        active_terms: "none".into(),
-        lunch_options: String::new(),
-    }
-}
-
 fn candidate(text: &str, finish: &str) -> Value {
     json!({"candidates": [{"finishReason": finish, "content": {"parts": [{"text": text}]}}]})
 }
 
-async fn extract(b: Behaviour) -> (Result<ExtractOutput, ApiError>, Seen) {
+/// The negotiation judge over generateContent (same transport as lunch extraction).
+async fn extract(b: Behaviour) -> (Result<Judgment, ApiError>, Seen) {
     let (base, seen) = server(b).await;
     let ex = GeminiExtractor {
         cfg: cfg(&base),
         client: copilot_providers::http_client(),
     };
-    (ex.run(req()).await, seen)
+    let r = ex
+        .judge("firm, $100".into(), "speaker1: $1,150 delivered.".into())
+        .await;
+    (r, seen)
 }
 
 #[tokio::test]
 async fn extraction_success_uses_documented_request() {
-    let out = json!({"turn_kind":"new_offer","amends_offer_id":null,"terms":[]}).to_string();
+    let out = json!({"outcome":"PAUSE","reason":"Over $100."}).to_string();
     let (r, seen) = extract(Behaviour::Json(200, candidate(&out, "STOP"))).await;
-    assert!(matches!(r, Ok(ExtractOutput::Negotiation(_))), "{r:?}");
+    assert_eq!(r.unwrap().outcome, Outcome::Pause);
     assert_eq!(
         seen.path.lock().unwrap()[0],
         "/v1beta/models/gemini-3.8-flash:generateContent"
@@ -166,17 +160,11 @@ async fn extraction_failure_map() {
         ),
         (
             Behaviour::Json(200, candidate("not json", "STOP")),
-            "extraction_invalid_output",
+            "judge_invalid_output",
         ),
         (
-            Behaviour::Json(
-                200,
-                candidate(
-                    r#"{"turn_kind":"new_offer","amends_offer_id":null,"terms":[],"x":1}"#,
-                    "STOP",
-                ),
-            ),
-            "extraction_invalid_output",
+            Behaviour::Json(200, candidate(r#"{"outcome":"MAYBE","reason":"x"}"#, "STOP")),
+            "judge_invalid_output",
         ),
         (
             Behaviour::Json(400, json!({"error": {"code": 400}})),
@@ -214,32 +202,25 @@ async fn decider(b: Behaviour) -> (GeminiDecider, Seen) {
 
 #[tokio::test]
 async fn decisions_contract_and_failures() {
-    let ok = json!({"answers": {"unaddressed_condition": {"type": "noul", "noul": 0.05, "confidence": 0.95}}, "usage": {}});
-    let (d, seen) = decider(Behaviour::Json(200, ok)).await;
-    assert_eq!(
-        d.noul("t".into(), "w".into()).await.unwrap(),
-        NoulVerdict::Clear { p_yes: 0.05 }
-    );
-    assert_eq!(seen.path.lock().unwrap()[0], "/v1beta/decisions");
-    let body = seen.body.lock().unwrap()[0].clone();
-    assert_eq!(body["model"], "gemini-decision-1");
-    assert_eq!(body["questions"]["unaddressed_condition"]["type"], "noul");
-
     let mut opts = BTreeMap::new();
     opts.insert("B".to_string(), "x".to_string());
     opts.insert("C".to_string(), "y".to_string());
     let ch = json!({"answers": {"lunch_pick": {"type": "choice", "choice": "C", "probabilities": {"B": 0.3, "C": 0.7}, "confidence": 0.7}}});
-    let (d, _) = decider(Behaviour::Json(200, ch)).await;
+    let (d, seen) = decider(Behaviour::Json(200, ch)).await;
     assert_eq!(
         d.choice("s".into(), opts.clone()).await.unwrap().choice,
         "C"
     );
+    assert_eq!(seen.path.lock().unwrap()[0], "/v1beta/decisions");
+    let body = seen.body.lock().unwrap()[0].clone();
+    assert_eq!(body["model"], "gemini-decision-1");
+    assert_eq!(body["questions"]["lunch_pick"]["type"], "choice");
 
     let cases: Vec<(Behaviour, &str)> = vec![
         (
             Behaviour::Json(
                 200,
-                json!({"answers": {"unaddressed_condition": {"type": "noul", "noul": 0.05, "confidence": 0.5}}}),
+                json!({"answers": {"lunch_pick": {"type": "choice", "choice": "B", "probabilities": {"B": 0.3, "C": 0.7}, "confidence": 0.3}}}),
             ),
             "provider_invalid_output",
         ),
@@ -270,37 +251,37 @@ async fn decisions_contract_and_failures() {
     ];
     for (b, want) in cases {
         let (d, _) = decider(b).await;
-        assert_eq!(d.noul("t".into(), "w".into()).await.unwrap_err().code, want);
+        assert_eq!(
+            d.choice("s".into(), opts.clone()).await.unwrap_err().code,
+            want
+        );
     }
 }
 
 #[tokio::test]
 async fn slow_valid_extraction_within_ten_seconds_succeeds() {
-    let out = json!({"turn_kind":"new_offer","amends_offer_id":null,"terms":[]}).to_string();
+    let out = json!({"outcome":"ASK","reason":"Trial?"}).to_string();
     let (r, _) = extract(Behaviour::Delay(
         7_500,
         Box::new(Behaviour::Json(200, candidate(&out, "STOP"))),
     ))
     .await;
-    assert!(matches!(r, Ok(ExtractOutput::Negotiation(_))), "{r:?}");
+    assert_eq!(r.unwrap().outcome, Outcome::Ask);
 }
 
 #[test]
 fn provider_schemas_carry_no_array_bounds() {
-    // array bounds made the negotiation schema exceed Gemini's decoding limits;
-    // the 12-term cardinality is enforced server-side instead
-    for mode in [Mode::Negotiation, Mode::Lunch] {
-        let req = ExtractRequest {
-            mode,
+    // array bounds can exceed Gemini's decoding limits; cardinality is enforced server-side
+    let lunch = copilot_providers::extraction_body(
+        &ExtractRequest {
             transcript: "x".into(),
-            active_offer_id: None,
-            active_terms: String::new(),
             lunch_options: String::new(),
-        };
-        let body = copilot_providers::extraction_body(&req, "LOW").to_string();
-        assert!(
-            !body.contains("maxItems") && !body.contains("minItems"),
-            "{mode:?}"
-        );
+        },
+        "LOW",
+    )
+    .to_string();
+    let judge = copilot_providers::judge_body("g", "c", "LOW").to_string();
+    for body in [lunch, judge] {
+        assert!(!body.contains("maxItems") && !body.contains("minItems"));
     }
 }

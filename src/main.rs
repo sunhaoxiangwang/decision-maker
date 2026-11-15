@@ -78,7 +78,7 @@ fn main() {
                 }
             }
         } else if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Context) {
-            // goal update spoken between three-wave gestures: proposal only, never an LED cue
+            // goal update spoken between three-wave gestures: added to the goals, never an LED cue
             if sends_three_waves_context(band.is_some()) {
                 match c.context_update(t.turn_id, &t.text) {
                     Ok(r) => {
@@ -110,29 +110,22 @@ fn notice(bridge: &Bridge, message: &str) {
 
 fn hint(e: &str) -> &'static str {
     if e.contains("no active session") || e.contains("no_active_session") {
-        " Start a session at http://127.0.0.1:8787/, or run the server with COPILOT_VOICE_GOALS=auto."
-    } else if e.contains("goals_unconfirmed") {
-        " Wave three times and say your size, firmness, budget and return period."
+        " Start a session at http://127.0.0.1:8787/."
     } else {
         ""
     }
 }
 
-/// What a wave did to the goals: applied changes (auto mode), a proposal to confirm, or why not.
+/// What a wave did to the goals: the goals as they now stand, or why nothing changed.
 fn goals_notice(r: &serde_json::Value) -> String {
-    let p = &r["proposal"];
-    let changes: Vec<String> = p["changes"].as_array().into_iter().flatten()
-        .map(|c| c["new"].as_str().unwrap_or("?").to_string()) // e.g. "budget $1,300.00 incl. delivery"
-        .collect();
-    let notes: Vec<&str> = p["rejected"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
-    let status = r["status"].as_str().unwrap_or("?");
-    let head = match status {
-        "APPLIED" => format!("Goals updated: {}.", changes.join(", ")),
-        "PROPOSED" => format!("Goal change proposed: {}. Confirm it in the copilot UI.", changes.join(", ")),
-        "PENDING" => "Reading the goal update…".to_string(),
-        other => format!("Goal update {}: {}.", other.to_lowercase(), r["error"]["message"].as_str().unwrap_or("no change")),
-    };
-    if notes.is_empty() { head } else { format!("{head} {}", notes.join("; ")) }
+    match r["status"].as_str() {
+        Some("APPLIED") => format!("Goals updated: {}", r["goals"].as_str().unwrap_or("?")),
+        other => format!(
+            "Goal update {}: {}.",
+            other.unwrap_or("?").to_lowercase(),
+            r["error"]["message"].as_str().unwrap_or("no change")
+        ),
+    }
 }
 
 /// true with the band, where the wrapper opens a context window solely on three recognised

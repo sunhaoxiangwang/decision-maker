@@ -1,5 +1,6 @@
-//! Client for Leo's copilot server (`vexo-copilot/1`, docs/contract-v1.md). The bridge only
-//! submits final conversation turns; goals and memory are confirmed in the copilot UI.
+//! Client for Leo's copilot server (`vexo-copilot/1`, docs/contract-v1.md). The bridge submits
+//! final conversation turns and spoken goal updates; with no active session it starts a
+//! negotiation session (goals are optional free text, so none needs setting up first).
 use crate::bridge::Cue;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -90,18 +91,10 @@ impl Copilot {
         })
     }
 
-    /// Submits one final transcript captured between waves as a voice context update. The
-    /// result is never actionable: the proposal is confirmed (or discarded) in the copilot UI.
+    /// Submits one final transcript captured between waves as a spoken goal update: the words
+    /// are added to the goals as said and apply at once. The result is never actionable.
     /// `source_seq` shares the turn counter, so turns and updates stay strictly ordered.
     pub fn context_update(&self, turn_id: u64, text: &str) -> Result<Value, String> {
-        // With COPILOT_VOICE_GOALS=auto on the server, the first wave starts the session and
-        // sets the goals; otherwise the server refuses and the UI-only message stands.
-        if let Err(e) = self.discover() {
-            if !e.contains("no active session") {
-                return Err(e);
-            }
-            self.request("POST", "/v1/sessions", Some(&json!({"protocol": "vexo-copilot/1"}))).map_err(|_| e)?;
-        }
         self.post("context update", |a, seq| {
             let sid = &a.session_id;
             (format!("/v1/sessions/{sid}/context-updates"), json!({
@@ -144,10 +137,13 @@ impl Copilot {
 
     /// `GET /v1/sessions/active`; logs when the instance, session or mode differs from the last.
     fn discover(&self) -> Result<Active, String> {
-        let v = self.request("GET", "/v1/sessions/active", None).map_err(|e| match e.as_str() {
-            "copilot: no_active_session" => "copilot: no active session: start one in the copilot UI".into(),
-            _ => e,
-        })?;
+        let v = match self.request("GET", "/v1/sessions/active", None) {
+            Err(e) if e == "copilot: no_active_session" => {
+                println!("  copilot: no active session; starting a negotiation session");
+                self.request("POST", "/v1/sessions", Some(&json!({"protocol": "vexo-copilot/1"})))?
+            }
+            r => r?,
+        };
         let a = Active::from_info(&v).ok_or("copilot: malformed session_info")?;
         let mut last = self.session.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(p) = last.as_ref().filter(|p| !p.same_session(&a)) {

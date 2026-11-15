@@ -206,3 +206,13 @@ td.note small { display: block; }
 .agent-context p { margin: 8px 0 6px; font-size: 13px; }
 @media (max-width: 600px) { .convo .bubble { max-width: 92%; } }
 .topbar .title { font-size: 18px; margin: 0 6px 0 0; }
+
+/* Right-panel decision window: fixed height so the three lights never move; only the
+   current call lights up, the other two stay dark. */
+.decision-window { height: 132px; box-sizing: border-box; overflow: hidden; display: grid; grid-template-rows: auto 1fr;
+  gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; }
+.decision-window .scale { max-width: none; }
+.decision-window .scale li { opacity: .25; }
+.decision-window .scale li.on { opacity: 1; }
+.decision-reason { margin: 0; font-size: 13px; line-height: 1.35; overflow: hidden; display: -webkit-box;
+  -webkit-line-clamp: 3; -webkit-box-orient: vertical; }

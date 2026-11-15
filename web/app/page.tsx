@@ -2,7 +2,7 @@
 import Link from 'next/link';
 import MemoryCapture from '@/components/MemoryCapture';
 import Conversation from '@/components/Conversation';
-import DecisionCard from '@/components/DecisionCard';
+import { CueScale } from '@/components/CueBadge';
 import { decisionRequest } from '@/lib/memory';
 import { useNames } from '@/lib/names';
 import { selectedTurn, visibleTurns } from '@/lib/store';
@@ -12,7 +12,7 @@ const MIC = { live: '● Mic live', 'cue-hold': 'Mic paused for cue', off: 'Mic 
 
 export default function Live() {
   const { state, dispatch, link } = useBridge();
-  const { session, status } = state;
+  const { status } = state;
   const { name } = useNames();
 
   const sel = selectedTurn(state);
@@ -77,7 +77,7 @@ export default function Live() {
         <div className="dock">
           <MemoryCapture state={state} />
           <p className="fine">
-            Goals, budget changes and memory are confirmed in the copilot. Speech never confirms them.
+            Goals are free text in the copilot (http://127.0.0.1:8787/); a wave adds what you say to them.
           </p>
         </div>
       </section>
@@ -86,9 +86,11 @@ export default function Live() {
           <h2>Decision{sel != null && ` · turn ${sel}`}</h2>
           {state.pinned != null && <button className="ghost" onClick={() => dispatch({ type: 'pin', turn_id: null })}>Follow latest</button>}
         </header>
-        {sel == null
-          ? <p className="muted">Decisions come from the copilot server for each finished turn. Start a session and confirm goals at http://127.0.0.1:8787/.</p>
-          : <DecisionCard turn={turn} d={d} options={session.lunch_options} />}
+        {/* fixed-size window: the three lights never move; only the current call lights up */}
+        <div className="decision-window">
+          <CueScale cue={turn?.cue ?? d?.cue ?? 'Off'} />
+          <p className="decision-reason">{d?.reason ?? (sel == null ? 'Waiting for the first finished turn.' : 'No decision for this turn.')}</p>
+        </div>
         <section>
           <h3>Memory for {request ? `turn ${request.turn.turn_id} · ${request.turn.speaker}` : 'the next turn'}</h3>
           {!request || request.memory.length === 0 ? (

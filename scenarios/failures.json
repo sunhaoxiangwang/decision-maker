@@ -1,9 +1,15 @@
 {
   "name": "failures (run against a server WITHOUT GEMINI_API_KEY: providers=unconfigured)",
   "mode": "negotiation",
-  "goals": {"size": "queen", "firmness": "firm", "budget": 1200, "nights": 100},
+  "goals": "A firm queen mattress, no more than $1,200 including delivery.",
   "steps": [
-    {"turn": "Best I can do is $1,150 delivered, queen, firm, with a 100-night return.", "expect": "UNAVAILABLE"},
-    {"turn": "Thanks.", "expect": "UNAVAILABLE"}
+    {
+      "turn": "Best I can do is $1,150 delivered, queen, firm, with a 100-night trial.",
+      "expect": "UNAVAILABLE"
+    },
+    {
+      "turn": "Thanks.",
+      "expect": "UNAVAILABLE"
+    }
   ]
 }

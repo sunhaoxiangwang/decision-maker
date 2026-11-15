@@ -4,7 +4,7 @@ use crate::memory::{FailPoint, Gate, MemoryHub};
 use copilot_core::contract::*;
 use copilot_core::limits::*;
 use copilot_core::session::*;
-use copilot_providers::{Decider, ExtractOutput, ExtractRequest, Extractor};
+use copilot_providers::{Decider, ExtractRequest, Extractor};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,9 +49,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub bridge_token: Option<String>,
     pub providers_label: String,
-    /// COPILOT_VOICE_GOALS=auto: spoken goal updates apply without confirmation, and the
-    /// bridge may start a negotiation session (otherwise only the companion UI does).
-    pub voice_goals_auto: bool,
 }
 
 pub struct App {
@@ -140,8 +137,7 @@ impl App {
     /// Create a new active session; the previous one is closed.
     pub fn create_session(self: &Arc<Self>, mode: Mode) -> Arc<SessionHandle> {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut s = Session::new(&id, mode, &self.instance_id, &self.cfg.providers_label);
-        s.auto_goals = self.cfg.voice_goals_auto;
+        let s = Session::new(&id, mode, &self.instance_id, &self.cfg.providers_label);
         let snap = Arc::new(s.snapshot("init"));
         let (tx, _) = watch::channel(snap);
         let h = Arc::new(SessionHandle {
@@ -230,7 +226,6 @@ pub async fn worker(app: Arc<App>, h: Arc<SessionHandle>) {
                 match job {
                     Job::Turn { seq } => s.fail_before_apply(seq, err, app.now_ms()),
                     Job::Evaluate { trigger } => s.fail_after_apply(trigger, err, app.now_ms()),
-                    Job::Context { seq } => s.fail_context(seq, err),
                 }
                 h.publish(&s);
                 continue;
@@ -260,23 +255,6 @@ pub async fn worker(app: Arc<App>, h: Arc<SessionHandle>) {
                     } else {
                         s.fail_before_apply(seq, err, app.now_ms());
                     }
-                    h.publish(&s);
-                }
-            }
-            Job::Context { seq } => {
-                let r =
-                    tokio::time::timeout_at(deadline, process_context(&app, &h, seq, deadline_ms))
-                        .await;
-                if r.is_err() {
-                    let mut s = h.state.lock().expect("session");
-                    s.fail_context(
-                        seq,
-                        ApiError::new(
-                            "job_deadline",
-                            format!("context update exceeded {JOB_DEADLINE_MS} ms"),
-                            true,
-                        ),
-                    );
                     h.publish(&s);
                 }
             }
@@ -315,13 +293,22 @@ async fn process_turn(app: &Arc<App>, h: &Arc<SessionHandle>, seq: u64, deadline
             None => return,
         }
     };
+    // negotiation: nothing to extract; the turn joins the conversation the judge reads
+    if ctx.mode == Mode::Negotiation {
+        {
+            let mut s = h.state.lock().expect("session");
+            let ok = s.apply_conversation(seq);
+            h.publish(&s);
+            if !ok {
+                return;
+            }
+        }
+        return process_eval(app, h, Some(seq), true, deadline_ms).await;
+    }
     loop {
         let t0 = Instant::now();
         let req = ExtractRequest {
-            mode: ctx.mode,
             transcript: ctx.text.clone(),
-            active_offer_id: ctx.active_offer_id.clone(),
-            active_terms: ctx.active_terms.clone(),
             lunch_options: ctx.lunch_prompt.clone(),
         };
         let res = app.extractor.extract(req).await;
@@ -335,17 +322,7 @@ async fn process_turn(app: &Arc<App>, h: &Arc<SessionHandle>, seq: u64, deadline
                 h.publish(&s);
                 return;
             }
-            Ok(ExtractOutput::Negotiation(ext)) if ctx.mode == Mode::Negotiation => {
-                s.apply_negotiation(&ctx, &ext, app.extractor.name(), now)
-            }
-            Ok(ExtractOutput::Lunch(ext)) if ctx.mode == Mode::Lunch => {
-                s.apply_lunch(&ctx, &ext, app.extractor.name(), now)
-            }
-            Ok(_) => PhaseA::Invalid(ApiError::new(
-                "extraction_invalid_output",
-                "wrong extraction mode",
-                false,
-            )),
+            Ok(ext) => s.apply_lunch(&ctx, &ext, app.extractor.name(), now),
         };
         match outcome {
             PhaseA::Applied => {
@@ -423,9 +400,14 @@ async fn process_eval(
     };
     let d0 = Instant::now();
     let result = match &ctx.request {
-        ContextualRequest::Noul { terms, window } => {
-            ContextualResult::Noul(app.decider.noul(terms.clone(), window.clone()).await)
-        }
+        ContextualRequest::Judge {
+            goals,
+            conversation,
+        } => ContextualResult::Judge(
+            app.extractor
+                .judge(goals.clone(), conversation.clone())
+                .await,
+        ),
         ContextualRequest::Choice {
             soft_prefs,
             options,
@@ -482,26 +464,5 @@ fn fail_deadline(app: &App, h: &SessionHandle, trigger: Option<u64>) {
         ),
         app.now_ms(),
     );
-    h.publish(&s);
-}
-
-/// Voice-context extraction: snapshot under the lock, call the provider with no
-/// lock held, commit a proposal (never applied) under the lock.
-async fn process_context(app: &Arc<App>, h: &Arc<SessionHandle>, seq: u64, deadline_ms: u64) {
-    let job = {
-        let mut s = h.state.lock().expect("session");
-        let j = s.start_context(seq, app.now_ms(), deadline_ms);
-        h.publish(&s);
-        match j {
-            Some(j) => j,
-            None => return,
-        }
-    };
-    let res = app
-        .extractor
-        .extract_context(job.text.clone(), job.goals_summary.clone())
-        .await;
-    let mut s = h.state.lock().expect("session");
-    s.commit_context(&job, res, app.now_ms());
     h.publish(&s);
 }

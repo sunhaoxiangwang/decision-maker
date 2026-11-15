@@ -206,15 +206,9 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
             for i in range(5):
                 fake.handlers["motion"](SimpleNamespace(t=start + i * 200, gz=first if i % 2 == 0 else -first))
 
-        def three_waves(start):  # detected at start+0.8 s, +3.2 s, +5.6 s; direction does not matter
-            for k, first in enumerate([300, -300, 300]):
-                wave(start + k * 2400, first)
+        three_waves = wave  # one wave toggles memory (the name is the copilot trigger's)
 
-        wave(0)
-        wave(2400)  # two waves (detected at 0.8 s and 3.2 s): nothing changes, nothing is captured as context
-        assert not bp.memory_on and memory_modes == [] and bp.decisions_on
-        assert sent[-1][2] == "conversation"
-        three_waves(12000)  # the two earlier waves are > 8 s old: only the third of these toggles
+        three_waves(12000)
         assert bp.memory_on and memory_modes == [True]
         assert sent[-1] == ("last conversation words", True, "conversation")
         bp._resume.callback()
@@ -261,11 +255,10 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
 
 print("registered gestures, LEDs, drain and failures ok")
 
-# ---- three waves --------------------------------------------------------------------------
-# The registered motion handler: only THREE_WAVES detected waves within THREE_WAVE_WINDOW_MS
-# toggle memory. Fewer, or spread wider, never call set_memory_mode, so no speech is captured
-# as context (the only purpose Rust sends to the copilot as trigger three_waves).
-assert (bp.THREE_WAVES, bp.THREE_WAVE_WINDOW_MS) == (3, 8000)
+# ---- one wave ----------------------------------------------------------------------------
+# The registered motion handler: each detected wave (any direction) toggles memory; slow single
+# swings are not waves.
+assert bp.THREE_WAVES == 1
 bp.band = fake = FakeBand()
 bp.decisions_on, bp.memory_on, bp._capture_failed, bp.ears = False, False, False, None
 memory_modes.clear()
@@ -279,86 +272,26 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
         for i in range(5):
             fake.handlers["motion"](SimpleNamespace(t=start + i * 200, gz=first if i % 2 == 0 else -first))
 
-    wave_at(0)                                   # wave 1 (detected at 800)
-    assert toggles == []
-    wave_at(2400, -300)                          # wave 2, starting the other way (3200)
-    assert toggles == []
-    wave_at(10000)                               # wave 3 at 10800: wave 1 is > 8 s old
-    assert toggles == []
-    wave_at(12400, -300)                         # 3200, 10800, 13200 ... 3200 has expired too
-    assert toggles == []
-    wave_at(14800)                               # 10800, 13200, 15600: three within 8 s
+    wave_at(0)
     assert toggles == [True]
-    wave_at(30000, -300)
-    wave_at(32400, 300)
-    assert toggles == [True]                     # two more: nothing
-    wave_at(34800, -300)                         # three more: toggles again (off)
-    assert toggles == [True, True]
-    wave_at(50000)                               # the count restarts after each toggle
+    wave_at(2400, -300)
     assert toggles == [True, True]
     for start in (60000, 62400, 64800):          # slow single swings are not waves at all
         fake.handlers["motion"](SimpleNamespace(t=start, gz=300))
     assert toggles == [True, True]
-assert memory_modes == [] and not bp.memory_on   # (on_three_waves was stubbed: counting only)
 
-# The same counts through the real toggle: one or two waves leave capture off and emit nothing.
+# Through the real toggle: one wave starts capture, the next stops it.
 sent.clear()
 bp.band = fake = FakeBand()
 with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer", FakeTimer), \
         patch.object(bp.threading, "Thread", ImmediateThread):
     bp._watch_gestures()
     wave_at(0)
-    wave_at(2400, -300)
-    bp._emit("said after two waves", True)
-    assert not bp.memory_on and memory_modes == [] and sent == []
-    wave_at(4800)
     assert bp.memory_on and memory_modes == [True]
     bp._resume.callback()
-    bp._emit("said after three waves", True)
-    assert sent == [("said after three waves", True, "context")]
-    for k, start in enumerate((20000, 22400)):
-        wave_at(start, 300 if k % 2 else -300)
-        assert bp.memory_on and memory_modes == [True]  # one or two waves do not stop it
-    wave_at(24800, -300)
+    bp._emit("said after one wave", True)
+    assert sent == [("said after one wave", True, "context")]
+    wave_at(4800, -300)
     assert not bp.memory_on and memory_modes == [True, False]
     bp._resume.callback()
-print("three waves toggle, one or two do not, the window and any direction ok")
-
-if speech is not None:
-    # Continuous recognized speech is segmented without retaining all past final text.
-    bp.band = None
-    out = []
-    bounded = bp.Diarized()
-    speech.Speech.start(bounded, lambda text, final: out.append((text, final)))
-    bounded._parts = []
-    for _ in range(30):
-        bounded._message({"type": "Results", "is_final": True,
-                          "channel": {"alternatives": [{"transcript": "word " * 400}]}})
-    bounded._sentence_ends()
-    assert bounded.finals == []
-    assert all(len(text.encode("utf-8")) <= bp.MAX_TEXT_BYTES for text, final in out if final)
-    print("speech segmentation and stale cue regression ok")
-
-
-# Failed handoff closes both modes rather than blocking or silently losing future turns.
-bp.band, bp.ears = None, None
-bp.decisions_on, bp.memory_on, bp._capture_failed = True, False, False
-bp.emit = lambda *_: False
-with patch.object(bp.threading, "Thread", ImmediateThread):
-    bp._emit("rejected by full consumer", True)
-assert not bp.decisions_on and not bp.memory_on and bp._capture_failed
-print("bounded consumer failure stops capture ok")
-
-
-if speech is not None:
-    # Test timeout without waiting for a real socket or contacting Deepgram.
-    probe = bp.Diarized()
-    checks = []
-    probe._done = SimpleNamespace(wait=lambda _: False)
-    probe._pending_lock = bp.threading.Lock()
-    probe._pending_sends = {1: bp.time.monotonic() - 10}
-    probe._ws = SimpleNamespace(sock=SimpleNamespace(shutdown=lambda _: checks.append('socket aborted')))
-    with patch.object(bp, '_fail_capture', lambda *args, **kw: checks.append('capture failed')):
-        probe._write_watchdog()
-    assert checks == ['socket aborted', 'capture failed']
-    print('speech write deadline ok')
+print("one wave toggles memory, any direction ok")

@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use copilot_core::context::{ContextUpdateRequest, CtxAcceptReq, CtxStatus, TRIGGER_THREE_WAVES};
+use copilot_core::context::{ContextUpdateRequest, CtxAcceptReq, TRIGGER_THREE_WAVES};
 use copilot_core::contract::*;
 use copilot_core::limits::*;
 use copilot_core::session::{AcceptReq, Accepted, Session};
@@ -225,21 +225,9 @@ pub async fn get_active(State(app): State<Arc<App>>) -> Response {
     }
 }
 
-/// Auto voice-goals mode only: the bridge starts a negotiation session (or gets the active
-/// one), so the first wave can set the goals with no companion-UI step.
+/// The bridge gets the active session, or starts a negotiation session when there is none
+/// (negotiation needs no setup: goals are optional free text).
 pub async fn post_session(State(app): State<Arc<App>>) -> Response {
-    if !app.cfg.voice_goals_auto {
-        return err_env(
-            &app,
-            StatusCode::FORBIDDEN,
-            "sessions_ui_only",
-            "sessions are started in the companion UI (set COPILOT_VOICE_GOALS=auto to allow the bridge)",
-            false,
-            None,
-            None,
-            None,
-        );
-    }
     let h = match app.active() {
         Some(h) => h,
         None => app.create_session(Mode::Negotiation),
@@ -729,9 +717,6 @@ pub async fn get_occupancy(State(app): State<Arc<App>>) -> Response {
     let mut sessions = Vec::new();
     for h in active.iter().chain(closed.iter()) {
         let s = h.state.lock().expect("session");
-        let offer_turn_seqs = s.active.as_ref().map(|o| o.turn_seqs.len()).unwrap_or(0);
-        let facts = s.active.as_ref().map(|o| o.facts.len()).unwrap_or(0)
-            + s.archived.iter().map(|o| o.facts.len()).sum::<usize>();
         let rejected: usize = s.turns.iter().map(|t| t.rejected_terms.len()).sum();
         let max_turn_result = s
             .turns
@@ -742,11 +727,8 @@ pub async fn get_occupancy(State(app): State<Arc<App>>) -> Response {
             .unwrap_or(0);
         sessions.push(serde_json::json!({
             "session_id": s.id, "closed": s.closed, "turns": s.turns.len(),
-            "transcript_bytes": s.transcript_bytes, "archived_offers": s.archived.len(),
-            "tombstones": s.tombstones.len(), "facts": facts, "offer_turn_seqs": offer_turn_seqs,
+            "transcript_bytes": s.transcript_bytes, "goal_updates": s.goal_updates.len(),
             "barriers": s.barriers.len(), "ambiguous": s.ambiguous.len(), "rejected_terms": rejected,
-            "offer_unresolved": s.active.as_ref().map(|o| o.unresolved.len()).unwrap_or(0),
-            "offer_conditions": s.active.as_ref().map(|o| o.conditions.len()).unwrap_or(0),
             "lunch_unresolved": s.lunch.as_ref().map(|l| l.unresolved.len()).unwrap_or(0),
             "queue": s.queue.len(),
             "snapshot_bytes": serde_json::to_vec(&s.snapshot("occupancy")).map(|v| v.len()).unwrap_or(0),
@@ -760,10 +742,9 @@ pub async fn get_occupancy(State(app): State<Arc<App>>) -> Response {
         "jobs_running": app.jobs_running.load(std::sync::atomic::Ordering::SeqCst),
         "jobs_peak": app.jobs_peak.load(std::sync::atomic::Ordering::SeqCst),
         "limits": {"sessions": 1 + CLOSED_SESSIONS_KEPT, "turns": TURN_RECORDS_PER_SESSION,
-                   "transcript_bytes": TRANSCRIPT_BYTES_PER_SESSION, "archived_offers": OFFERS_PER_SESSION,
-                   "tombstones": TOMBSTONES_PER_SESSION, "offer_turn_seqs": CONTEXT_MAX_TURNS + 1,
-                   "unresolved_turns": MAX_UNRESOLVED_TURNS, "offer_unresolved": UNRESOLVED_PER_OFFER,
-                   "offer_conditions": CONDITIONS_PER_OFFER, "lunch_unresolved": LUNCH_UNRESOLVED_MAX, "snapshot_bytes": SNAPSHOT_MAX_BYTES,
+                   "transcript_bytes": TRANSCRIPT_BYTES_PER_SESSION,
+                   "goal_updates": copilot_core::context::CONTEXT_HISTORY,
+                   "unresolved_turns": MAX_UNRESOLVED_TURNS, "lunch_unresolved": LUNCH_UNRESOLVED_MAX, "snapshot_bytes": SNAPSHOT_MAX_BYTES,
                    "turn_result_bytes": TURN_RESULT_MAX_BYTES},
         "sessions": sessions,
     }))
@@ -771,7 +752,7 @@ pub async fn get_occupancy(State(app): State<Arc<App>>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Voice-context updates (negotiation only; never actionable)
+// Spoken goal updates (negotiation only; applied at once, never actionable)
 // ---------------------------------------------------------------------------
 
 fn ctx_status_for(code: &str) -> StatusCode {
@@ -780,28 +761,6 @@ fn ctx_status_for(code: &str) -> StatusCode {
             StatusCode::UNPROCESSABLE_ENTITY
         }
         c => status_for(c),
-    }
-}
-
-async fn wait_context(h: &SessionHandle, update_id: &str, max_ms: u64) {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(max_ms);
-    loop {
-        let notified = h.changed.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        {
-            let s = h.state.lock().expect("session");
-            let pending = s
-                .context
-                .as_ref()
-                .is_some_and(|c| c.update_id == update_id && c.status == CtxStatus::Pending);
-            if !pending {
-                return;
-            }
-        }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
-            return;
-        }
     }
 }
 
@@ -917,7 +876,6 @@ pub async fn post_context_update(
             )
         }
     };
-    wait_context(&h, &req.update_id, TURN_RESPONSE_WAIT_MS).await;
     let s = h.state.lock().expect("session");
     match s.context_result(&req.source_id, &req.update_id, &app.request_id()) {
         Some(r) => {

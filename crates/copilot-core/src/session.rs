@@ -1,192 +1,15 @@
-//! Pure session state machine: turns, offers, facts, conditions, barriers,
-//! two-phase application and decision publication (PLAN v3 §3-4, v4 §2-4).
+//! Pure session state machine: turns, barriers, two-phase application and decision
+//! publication. Negotiation turns are judged by the model against free-text goals;
+//! lunch keeps its fact extraction and rules.
 //! The server wraps a `Session` in a mutex and performs provider I/O outside it.
 
-use crate::contextual::NoulVerdict;
 use crate::contract::*;
+use crate::judge::Judgment;
 use crate::limits::*;
 use crate::lunch::{self, LunchState};
-use crate::money::fmt_cents;
-use crate::negotiation::*;
 use crate::text::{bounded, excerpt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Fact {
-    pub id: u64,
-    pub version: u64,
-    pub stmt: Stmt,
-    pub confirmed: bool,
-    pub source_seq: Option<u64>,
-    pub excerpt: String,
-    pub excerpt_truncated: bool,
-    pub byte_range: Option<(usize, usize)>,
-    pub extractor: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConditionKind {
-    ContextualConcern,
-    ContextualUncertain,
-    ContextLimit,
-    /// More conditions than the per-offer limit: one blocking record spanning them.
-    Overflow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConditionStatus {
-    Unresolved,
-    ResolvedByUser,
-    SupersededByOffer,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Condition {
-    pub id: u64,
-    pub version: u64,
-    pub kind: ConditionKind,
-    pub covers: (u64, u64),
-    pub status: ConditionStatus,
-    pub note: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Offer {
-    pub id: String,
-    pub version: u64,
-    pub facts: Vec<Fact>,
-    pub conditions: Vec<Condition>,
-    pub created_seq: u64,
-    pub turn_seqs: Vec<u64>,
-    pub resolved_through_seq: u64,
-    /// Highest turn number dropped from the bounded `turn_seqs` list.
-    pub dropped_through: u64,
-    /// Rejected critical interpretations; open ones block positive outcomes.
-    pub unresolved: Vec<Unresolved>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Unresolved {
-    pub id: u64,
-    pub version: u64,
-    pub field: String,
-    pub reason: String,
-    pub excerpt: String,
-    pub source_seq: u64,
-    pub open: bool,
-    /// Rejected readings merged into this record after the per-offer limit.
-    pub merged: u32,
-}
-
-impl Offer {
-    pub fn stmts(&self) -> Vec<&Stmt> {
-        self.facts.iter().map(|f| &f.stmt).collect()
-    }
-    pub fn open_unresolved(&self) -> Vec<&Unresolved> {
-        self.unresolved.iter().filter(|u| u.open).collect()
-    }
-    /// Record a rejected interpretation without silently dropping evidence:
-    /// dismissed records are reclaimed first; past the limit, readings merge into
-    /// one blocking overflow record that keeps the latest excerpt and turn range.
-    fn record_unresolved(&mut self, u: Unresolved) {
-        if self.unresolved.len() >= UNRESOLVED_PER_OFFER {
-            self.unresolved.retain(|x| x.open);
-        }
-        if let Some(ov) = self
-            .unresolved
-            .iter_mut()
-            .find(|x| x.open && x.field == "overflow")
-        {
-            ov.merged += 1;
-            ov.version += 1;
-            ov.reason = format!(
-                "{} rejected readings beyond the {UNRESOLVED_PER_OFFER}-record limit (turns {}-{}); latest: {}",
-                ov.merged, ov.source_seq, u.source_seq, u.reason
-            );
-            ov.excerpt = u.excerpt;
-            return;
-        }
-        if self.unresolved.len() + 1 >= UNRESOLVED_PER_OFFER {
-            self.unresolved.push(Unresolved {
-                field: "overflow".into(),
-                merged: 1,
-                reason: format!(
-                    "rejected readings reached the {UNRESOLVED_PER_OFFER}-record limit (from turn {}); latest: {}",
-                    u.source_seq, u.reason
-                ),
-                ..u
-            });
-            return;
-        }
-        self.unresolved.push(u);
-    }
-
-    /// Record a condition: resolved/superseded records are reclaimed first; if the
-    /// offer is still full, one blocking overflow condition spans every later
-    /// observation. Returns true when state changed.
-    fn record_condition(&mut self, c: Condition) -> bool {
-        if self.conditions.len() >= CONDITIONS_PER_OFFER {
-            self.conditions
-                .retain(|x| x.status == ConditionStatus::Unresolved);
-        }
-        if let Some(ov) = self
-            .conditions
-            .iter_mut()
-            .find(|x| x.status == ConditionStatus::Unresolved && x.kind == ConditionKind::Overflow)
-        {
-            ov.covers = (ov.covers.0.min(c.covers.0), ov.covers.1.max(c.covers.1));
-            ov.version += 1;
-            ov.note = format!(
-                "more conditions than recordable (turns {}-{}); latest: {}",
-                ov.covers.0, ov.covers.1, c.note
-            );
-            return true;
-        }
-        if self.conditions.len() + 1 >= CONDITIONS_PER_OFFER {
-            let covers = self
-                .conditions
-                .iter()
-                .filter(|x| x.status == ConditionStatus::Unresolved)
-                .fold(c.covers, |a, x| (a.0.min(x.covers.0), a.1.max(x.covers.1)));
-            self.conditions.push(Condition {
-                kind: ConditionKind::Overflow,
-                covers,
-                note: format!(
-                    "condition limit reached (turns {}-{}); latest: {}",
-                    covers.0, covers.1, c.note
-                ),
-                ..c
-            });
-            return true;
-        }
-        self.conditions.push(c);
-        true
-    }
-
-    fn push_turn(&mut self, seq: u64) {
-        self.turn_seqs.push(seq);
-        while self.turn_seqs.len() > CONTEXT_MAX_TURNS + 1 {
-            let d = self.turn_seqs.remove(0);
-            self.dropped_through = self.dropped_through.max(d);
-        }
-    }
-    pub fn unresolved_conditions(&self) -> Vec<&Condition> {
-        self.conditions
-            .iter()
-            .filter(|c| c.status == ConditionStatus::Unresolved)
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tombstone {
-    pub id: String,
-    pub created_seq: u64,
-    pub summary: String,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnStatus {
@@ -239,8 +62,6 @@ pub struct TurnRecord {
     pub timings: Timings,
     pub awaiting_since_ms: Option<u64>,
     pub human_wait_ms: u64,
-    /// Validated terms of an unclear turn, kept for explicit user resolution.
-    pub pending_terms: Vec<(Stmt, String, bool)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -282,10 +103,6 @@ pub enum Job {
     Evaluate {
         trigger: Option<u64>,
     },
-    /// Voice-context extraction (negotiation only).
-    Context {
-        seq: u64,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -294,9 +111,6 @@ pub struct ExtractCtx {
     pub attempt: u32,
     pub mode: Mode,
     pub text: String,
-    pub active_offer_id: Option<String>,
-    pub active_terms: String,
-    pub slot_versions: BTreeMap<Slot, Vec<(u64, u64)>>,
     pub lunch_option_versions: [u64; 3],
     pub lunch_prompt: String,
     pub reextracted: bool,
@@ -318,9 +132,10 @@ pub enum PhaseA {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextualRequest {
-    Noul {
-        terms: String,
-        window: String,
+    /// Negotiation: the model judges the conversation against the free-text goals.
+    Judge {
+        goals: String,
+        conversation: String,
     },
     Choice {
         soft_prefs: String,
@@ -333,8 +148,6 @@ pub struct EvalCtx {
     pub trigger: Option<u64>,
     pub state_rev: u64,
     pub memory_version: u64,
-    pub offer_id: Option<String>,
-    pub covers: (u64, u64),
     pub request: ContextualRequest,
     pub base: Decision,
     pub deadline_ms: u64,
@@ -355,7 +168,7 @@ pub enum EvalStart {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextualResult {
-    Noul(Result<NoulVerdict, ApiError>),
+    Judge(Result<Judgment, ApiError>),
     Choice(Result<crate::contextual::ChoiceAnswer, ApiError>),
 }
 
@@ -398,15 +211,9 @@ pub struct Session {
     pub closed: bool,
     pub phase: Phase,
     pub decision: Option<Decision>,
-    pub goals: NegGoals,
-    pub goals_confirmed: bool,
+    /// Negotiation goals as free text, in the user's own words (may be empty).
+    pub goals: String,
     pub goals_version: u64,
-    pub active: Option<Offer>,
-    pub archived: VecDeque<Offer>,
-    pub tombstones: VecDeque<Tombstone>,
-    pub next_offer_no: u64,
-    pub next_fact_id: u64,
-    pub next_cond_id: u64,
     pub turns: VecDeque<TurnRecord>,
     pub transcript_bytes: usize,
     pub next_server_seq: u64,
@@ -421,15 +228,8 @@ pub struct Session {
     pub memory_seen: u64,
     /// A user-triggered evaluation failed; retryable without changing facts.
     pub eval_failed: Option<ApiError>,
-    /// Latest voice-context update (negotiation only) and bounded history.
-    pub context: Option<crate::context::ContextUpdate>,
-    pub context_history: VecDeque<crate::context::ContextUpdate>,
-    pub context_proposals: u64,
-    /// COPILOT_VOICE_GOALS=auto: wave updates apply without confirmation, and the first
-    /// updates set the goals (decisions start once all four have been stated).
-    pub auto_goals: bool,
-    /// Goal fields stated by voice while goals were still unset (auto mode).
-    pub stated_goals: Vec<crate::context::CtxField>,
+    /// Recent spoken goal updates (negotiation only), for duplicates and lookup.
+    pub goal_updates: VecDeque<crate::context::GoalUpdate>,
 }
 
 fn stale(msg: &str) -> ApiError {
@@ -449,15 +249,8 @@ impl Session {
             closed: false,
             phase: Phase::Idle,
             decision: None,
-            goals: NegGoals::default(),
-            goals_confirmed: false,
+            goals: String::new(),
             goals_version: 1,
-            active: None,
-            archived: VecDeque::new(),
-            tombstones: VecDeque::new(),
-            next_offer_no: 1,
-            next_fact_id: 1,
-            next_cond_id: 1,
             turns: VecDeque::new(),
             transcript_bytes: 0,
             next_server_seq: 1,
@@ -474,11 +267,7 @@ impl Session {
             last_publish_ms: None,
             memory_seen: 0,
             eval_failed: None,
-            context: None,
-            context_history: VecDeque::new(),
-            context_proposals: 0,
-            auto_goals: false,
-            stated_goals: Vec::new(),
+            goal_updates: VecDeque::new(),
         }
     }
 
@@ -527,9 +316,12 @@ impl Session {
                 true,
             ),
         };
-        // provenance and timings belong to the current generation: a voice-context
+        // provenance and timings belong to the current generation: a spoken goal
         // update (timings unmeasured -> null) or the turn with that server_seq
-        let gen_ctx = self.context_by_seq(self.generation);
+        let gen_ctx = self
+            .goal_updates
+            .iter()
+            .find(|u| u.server_seq == self.generation);
         let lt = if gen_ctx.is_some() {
             None
         } else {
@@ -713,34 +505,6 @@ impl Session {
         }
     }
 
-    fn active_terms_summary(&self) -> String {
-        match &self.active {
-            None => "none".into(),
-            Some(o) => {
-                let parts: Vec<String> = o.facts.iter().map(|f| f.stmt.describe()).collect();
-                format!(
-                    "{}: {}",
-                    o.id,
-                    if parts.is_empty() {
-                        "no terms".into()
-                    } else {
-                        parts.join("; ")
-                    }
-                )
-            }
-        }
-    }
-
-    fn slot_versions(&self) -> BTreeMap<Slot, Vec<(u64, u64)>> {
-        let mut m: BTreeMap<Slot, Vec<(u64, u64)>> = BTreeMap::new();
-        if let Some(o) = &self.active {
-            for f in &o.facts {
-                m.entry(f.stmt.slot()).or_default().push((f.id, f.version));
-            }
-        }
-        m
-    }
-
     // ------------------------------------------------------------------
     // Turn admission
     // ------------------------------------------------------------------
@@ -815,13 +579,6 @@ impl Session {
                 false,
             ));
         }
-        if !self.goals_confirmed && self.mode == Mode::Negotiation {
-            return Err(ApiError::new(
-                "goals_unconfirmed",
-                "confirm goals before submitting turns",
-                false,
-            ));
-        }
         if self.mode == Mode::Lunch && !self.lunch.as_ref().is_some_and(|l| l.setup_confirmed) {
             return Err(ApiError::new(
                 "goals_unconfirmed",
@@ -875,7 +632,6 @@ impl Session {
             timings: Timings::default(),
             awaiting_since_ms: None,
             human_wait_ms: 0,
-            pending_terms: vec![],
         });
         self.generation = seq;
         // LED clear before extraction finishes (PLAN v2 §5.3, v4 R9)
@@ -915,9 +671,6 @@ impl Session {
             );
             return None;
         }
-        let active_terms = self.active_terms_summary();
-        let slot_versions = self.slot_versions();
-        let active_offer_id = self.active.as_ref().map(|o| o.id.clone());
         let (lunch_option_versions, lunch_prompt) = match &self.lunch {
             Some(l) => (l.option_versions(), l.prompt_context()),
             None => ([0; 3], String::new()),
@@ -934,9 +687,6 @@ impl Session {
             attempt: t.attempt,
             mode,
             text: t.text.clone(),
-            active_offer_id,
-            active_terms,
-            slot_versions,
             lunch_option_versions,
             lunch_prompt,
             reextracted: false,
@@ -959,9 +709,6 @@ impl Session {
             attempt: t.attempt,
             mode: self.mode,
             text: t.text.clone(),
-            active_offer_id: self.active.as_ref().map(|o| o.id.clone()),
-            active_terms: self.active_terms_summary(),
-            slot_versions: self.slot_versions(),
             lunch_option_versions,
             lunch_prompt,
             reextracted: true,
@@ -1003,7 +750,11 @@ impl Session {
         }
         t.status = TurnStatus::FailedBeforeApply;
         t.error = Some(err.clone());
-        self.barriers.insert(seq);
+        // lunch facts from this turn are missing until it is retried or discarded; a
+        // negotiation turn never blocks (the next judgement reads the whole conversation)
+        if self.mode == Mode::Lunch {
+            self.barriers.insert(seq);
+        }
         self.bump_state();
         if !self.later_turn_pending(Some(seq)) {
             let mut d = Decision::simple(
@@ -1041,289 +792,35 @@ impl Session {
         }
     }
 
-    fn offer_id(&self, n: u64) -> String {
-        // session-qualified so IDs never repeat across sessions
-        format!("{}:o{n}", self.id)
-    }
-
-    /// Apply a validated negotiation extraction atomically (Phase A).
-    pub fn apply_negotiation(
-        &mut self,
-        ctx: &ExtractCtx,
-        ext: &NegExtraction,
-        extractor: &str,
-        now_ms: u64,
-    ) -> PhaseA {
-        let Some(t) = self.turn(ctx.seq) else {
-            return PhaseA::Dropped;
-        };
-        if self.closed || t.status != TurnStatus::Extracting || t.effect_applied {
-            return PhaseA::Dropped;
-        }
-        if now_ms > ctx.deadline_ms {
-            return PhaseA::Expired;
-        }
-        if ext.terms.len() > MAX_EXTRACTED_TERMS {
-            return PhaseA::Invalid(ApiError::new(
-                "extraction_invalid_output",
-                format!(
-                    "{} terms exceed the {MAX_EXTRACTED_TERMS}-term contract; nothing applied",
-                    ext.terms.len()
-                ),
-                false,
-            ));
-        }
-        let transcript = t.text.clone();
-        // validate against the FULL transcript, then apply in-turn corrections
-        let mut valid = Vec::new();
-        let mut rejected: Vec<RejectedTerm> = Vec::new();
-        for raw in &ext.terms {
-            match validate_term(raw, &transcript) {
-                Ok(v) => valid.push(v),
-                Err(r) => rejected.push(r),
-            }
-        }
-        let valid = apply_in_turn_corrections(valid, &transcript);
-        let current_offer = self.active.as_ref().map(|o| o.id.clone());
-        let offer_changed = current_offer != ctx.active_offer_id;
-        let lower = transcript.to_lowercase();
-        let hypothetical = [
-            "what if",
-            "would you",
-            "could you",
-            "suppose",
-            "if we",
-            "if i",
-        ]
-        .iter()
-        .any(|m| lower.contains(m))
-            || lower.trim_end().ends_with('?');
-        let mut kind = ext.turn_kind;
-        // deterministic guard: explicit "same offer" / "keep all other terms" wording
-        // must never replace the active offer; a conflicting new_offer reading is
-        // treated as unclear (ASK) instead
-        if kind == TurnKind::NewOffer && current_offer.is_some() && keeps_other_terms(&transcript) {
-            kind = TurnKind::Ambiguous;
-        }
-        if matches!(kind, TurnKind::NewOffer | TurnKind::Amendment)
-            && (valid.is_empty() || hypothetical)
-        {
-            kind = TurnKind::Ambiguous;
-        }
-        if kind == TurnKind::Amendment
-            && (current_offer.is_none()
-                || ext.amends_offer_id.as_deref() != current_offer.as_deref())
-        {
-            kind = TurnKind::Ambiguous;
-        }
-        // version checks on affected slots (amendment) or offer identity (new offer)
-        if offer_changed {
-            return if ctx.reextracted {
-                self.mark_ambiguous(
-                    ctx.seq,
-                    &valid,
-                    &rejected,
-                    "offer changed during extraction",
-                )
-            } else {
-                PhaseA::Reextract
-            };
-        }
-        if kind == TurnKind::Amendment {
-            let now = self.slot_versions();
-            let touched: BTreeSet<Slot> = valid.iter().map(|v| v.stmt.slot()).collect();
-            let changed = touched
-                .iter()
-                .any(|s| now.get(s) != ctx.slot_versions.get(s));
-            if changed {
-                return if ctx.reextracted {
-                    self.mark_ambiguous(
-                        ctx.seq,
-                        &valid,
-                        &rejected,
-                        "terms changed during extraction",
-                    )
-                } else {
-                    PhaseA::Reextract
-                };
-            }
-            let touched_count = self
-                .active
-                .as_ref()
-                .map(|o| {
-                    o.facts
-                        .iter()
-                        .filter(|f| !touched.contains(&f.stmt.slot()))
-                        .count()
-                })
-                .unwrap_or(0);
-            if touched_count + valid.len() > FACTS_PER_OFFER {
-                // never silently drop evidence to satisfy a limit
-                return self.mark_ambiguous(ctx.seq, &valid, &rejected, "offer fact limit reached");
-            }
-        }
-        let seq = ctx.seq;
-        let mk_fact = |id: u64, v: &ValidatedTerm| Fact {
-            id,
-            version: 1,
-            stmt: v.stmt.clone(),
-            confirmed: false,
-            source_seq: Some(seq),
-            excerpt: v.excerpt.clone(),
-            excerpt_truncated: v.excerpt_truncated,
-            byte_range: v.byte_range,
-            extractor: extractor.to_string(),
-        };
-        let effect = match kind {
-            TurnKind::NewOffer => {
-                let id = self.offer_id(self.next_offer_no);
-                self.next_offer_no += 1;
-                let mut facts = Vec::new();
-                for v in valid.iter() {
-                    facts.push(mk_fact(self.next_fact_id, v));
-                    self.next_fact_id += 1;
-                }
-                if let Some(mut old) = self.active.take() {
-                    for c in old.conditions.iter_mut() {
-                        if c.status == ConditionStatus::Unresolved {
-                            c.status = ConditionStatus::SupersededByOffer;
-                        }
-                    }
-                    self.archive(old);
-                }
-                self.active = Some(Offer {
-                    id,
-                    version: 1,
-                    facts,
-                    conditions: vec![],
-                    created_seq: seq,
-                    turn_seqs: vec![seq],
-                    resolved_through_seq: seq.saturating_sub(1),
-                    dropped_through: 0,
-                    unresolved: vec![],
-                });
-                // replacement-offer exception: earlier barriers and ambiguities cleared
-                self.barriers.retain(|b| *b > seq);
-                self.ambiguous.retain(|a| *a > seq);
-                "new_offer"
-            }
-            TurnKind::Amendment => {
-                let mut next_id = self.next_fact_id;
-                let o = self.active.as_mut().expect("checked");
-                let touched: BTreeSet<Slot> = valid.iter().map(|v| v.stmt.slot()).collect();
-                o.facts.retain(|f| !touched.contains(&f.stmt.slot()));
-                for v in &valid {
-                    o.facts.push(mk_fact(next_id, v));
-                    next_id += 1;
-                }
-                o.version += 1;
-                o.push_turn(seq);
-                self.next_fact_id = next_id;
-                "amendment"
-            }
-            TurnKind::QuestionOrHypothetical | TurnKind::Irrelevant => {
-                if let Some(o) = self.active.as_mut() {
-                    o.push_turn(seq);
-                }
-                "no_change"
-            }
-            TurnKind::Ambiguous => {
-                return self.mark_ambiguous(seq, &valid, &rejected, "unclear statement")
-            }
-        };
-        // rejected critical interpretations of an offer-changing turn stay open
-        let blocking: Vec<&RejectedTerm> = if effect == "no_change" {
-            vec![]
-        } else {
-            rejected.iter().filter(|r| !r.context_only).collect()
-        };
-        let mut added_unresolved = false;
-        if !blocking.is_empty() {
-            if let Some(o) = self.active.as_mut() {
-                for r in blocking {
-                    o.record_unresolved(Unresolved {
-                        id: self.next_cond_id,
-                        version: 1,
-                        field: format!("{:?}", r.field).to_lowercase(),
-                        reason: bounded(&r.reason, 200).0,
-                        excerpt: r.excerpt.clone(),
-                        source_seq: seq,
-                        open: true,
-                        merged: 0,
-                    });
-                    self.next_cond_id += 1;
-                    added_unresolved = true;
-                }
-                o.version += 1;
-            }
-        }
-        let rejected_text = rejected_lines(&rejected);
-        let Some(t) = self.turn_mut(seq) else {
-            return PhaseA::Dropped;
-        };
-        t.status = TurnStatus::Applied;
-        t.effect_applied = true;
-        t.effect = Some(effect.into());
-        t.rejected_terms = rejected_text;
-        self.barriers.remove(&seq);
-        // facts/offers changed only for new offers and amendments; a no-change turn
-        // does not make open confirmation forms stale (the worker is serial, so no
-        // evaluation can interleave with this apply)
-        if effect != "no_change" || added_unresolved {
-            self.bump_state();
-        }
-        PhaseA::Applied
-    }
-
-    fn mark_ambiguous(
-        &mut self,
-        seq: u64,
-        valid: &[ValidatedTerm],
-        rejected: &[RejectedTerm],
-        why: &str,
-    ) -> PhaseA {
-        if let Some(o) = self.active.as_mut() {
-            o.push_turn(seq);
-        }
-        let mut lines = rejected_lines(rejected);
-        if lines.len() < LIST_MAX_ENTRIES {
-            lines.push(format!("unclear: {why}"));
-        }
-        let pending: Vec<(Stmt, String, bool)> = valid
-            .iter()
-            .take(MAX_EXTRACTED_TERMS)
-            .map(|v| (v.stmt.clone(), v.excerpt.clone(), v.excerpt_truncated))
-            .collect();
+    fn mark_ambiguous(&mut self, seq: u64, why: &str) -> PhaseA {
         let Some(t) = self.turn_mut(seq) else {
             return PhaseA::Dropped;
         };
         t.status = TurnStatus::Applied;
         t.effect_applied = true;
         t.effect = Some("ambiguous".into());
-        t.rejected_terms = lines;
-        t.pending_terms = pending;
+        t.rejected_terms = vec![format!("unclear: {why}")];
         self.ambiguous.insert(seq);
         self.barriers.remove(&seq);
         self.bump_state();
         PhaseA::Applied
     }
 
-    fn archive(&mut self, old: Offer) {
-        self.archived.push_back(old);
-        while self.archived.len() > OFFERS_PER_SESSION {
-            if let Some(o) = self.archived.pop_front() {
-                let summary: Vec<String> = o.facts.iter().map(|f| f.stmt.describe()).collect();
-                let (s, _) = crate::text::bounded(&summary.join("; "), 256);
-                self.tombstones.push_back(Tombstone {
-                    id: o.id,
-                    created_seq: o.created_seq,
-                    summary: s,
-                });
-                while self.tombstones.len() > TOMBSTONES_PER_SESSION {
-                    self.tombstones.pop_front();
-                }
-            }
+    /// Negotiation Phase A: the turn simply joins the conversation the judge reads.
+    pub fn apply_conversation(&mut self, seq: u64) -> bool {
+        let closed = self.closed;
+        let Some(t) = self.turn_mut(seq) else {
+            return false;
+        };
+        if closed || t.status != TurnStatus::Extracting {
+            return false;
         }
+        t.status = TurnStatus::Applied;
+        t.effect_applied = true;
+        t.effect = Some("conversation".into());
+        self.barriers.remove(&seq);
+        self.bump_state();
+        true
     }
 
     pub fn apply_lunch(
@@ -1365,15 +862,15 @@ impl Session {
             .any(|i| now[*i] != ctx.lunch_option_versions[*i])
         {
             if ctx.reextracted {
-                return self.mark_ambiguous(seq, &[], &[], "options changed during extraction");
+                return self.mark_ambiguous(seq, "options changed during extraction");
             }
             return PhaseA::Reextract;
         }
         if ext.turn_kind == lunch::LunchTurnKind::Ambiguous {
-            return self.mark_ambiguous(seq, &[], &[], "unclear statement");
+            return self.mark_ambiguous(seq, "unclear statement");
         }
         if !l.can_add(&valid) {
-            return self.mark_ambiguous(seq, &[], &[], "option fact limit reached");
+            return self.mark_ambiguous(seq, "option fact limit reached");
         }
         let fact_turn = matches!(ext.turn_kind, lunch::LunchTurnKind::OptionFacts);
         let mut changed = false;
@@ -1450,16 +947,6 @@ impl Session {
         }
     }
 
-    /// The user acted on a confirmation request: count the wait as human time.
-    fn record_human_wait(&mut self, now_ms: u64) {
-        let generation = self.generation;
-        if let Some(t) = self.turn_mut(generation) {
-            if let Some(since) = t.awaiting_since_ms.take() {
-                t.human_wait_ms += now_ms.saturating_sub(since);
-            }
-        }
-    }
-
     fn mark_superseded(&mut self, seq: u64) {
         if let Some(t) = self.turn_mut(seq) {
             if matches!(t.status, TurnStatus::Applied | TurnStatus::Evaluating) {
@@ -1502,12 +989,11 @@ impl Session {
             }
         }
         let rules = match self.mode {
-            Mode::Negotiation => self.negotiation_rules(),
+            Mode::Negotiation => self.judge_rules(trigger),
             Mode::Lunch => self.lunch_rules(memory),
         };
         match rules {
-            Rules::Final(d, conds) => {
-                self.add_conditions(conds);
+            Rules::Final(d) => {
                 self.publish(d, trigger, now_ms);
                 EvalStart::Committed
             }
@@ -1522,16 +1008,10 @@ impl Session {
                 }
                 EvalStart::Committed
             }
-            Rules::Contextual {
-                base,
-                request,
-                covers,
-            } => EvalStart::NeedsContextual(Box::new(EvalCtx {
+            Rules::Contextual { base, request } => EvalStart::NeedsContextual(Box::new(EvalCtx {
                 trigger,
                 state_rev: self.state_rev,
                 memory_version: memory.map(|m| m.publication).unwrap_or(0),
-                offer_id: self.active.as_ref().map(|o| o.id.clone()),
-                covers,
                 request,
                 base,
                 deadline_ms,
@@ -1539,45 +1019,7 @@ impl Session {
         }
     }
 
-    fn add_conditions(&mut self, conds: Vec<(ConditionKind, (u64, u64), String)>) {
-        if conds.is_empty() {
-            return;
-        }
-        let mut next = self.next_cond_id;
-        let mut added = false;
-        if let Some(o) = self.active.as_mut() {
-            for (kind, covers, note) in conds {
-                if covers.1 <= o.resolved_through_seq {
-                    continue; // stale observation of already-resolved turns
-                }
-                let dup = o.conditions.iter().any(|c| {
-                    c.status == ConditionStatus::Unresolved && c.kind == kind && c.covers == covers
-                });
-                if dup {
-                    continue;
-                }
-                if o.record_condition(Condition {
-                    id: next,
-                    version: 1,
-                    kind,
-                    covers,
-                    status: ConditionStatus::Unresolved,
-                    note,
-                }) {
-                    next += 1;
-                    o.version += 1;
-                    added = true;
-                }
-            }
-        }
-        self.next_cond_id = next;
-        if added {
-            self.bump_state();
-        }
-    }
-
-    /// Commit Phase B atomically: validate the snapshot, then record the job's
-    /// conditions and publish its decision together.
+    /// Commit Phase B atomically: validate the snapshot, then publish its decision.
     pub fn commit_contextual(
         &mut self,
         ctx: EvalCtx,
@@ -1598,10 +1040,6 @@ impl Session {
             }
             return Commit::Superseded;
         }
-        // re-checked under the commit lock: a pending context update makes this result stale
-        if self.context_open() {
-            return Commit::Stale;
-        }
         let mem_ok = memory.is_none_or(|m| {
             m.publication == ctx.memory_version
                 && m.publication >= self.memory_seen
@@ -1611,10 +1049,7 @@ impl Session {
         if self.mode == Mode::Lunch && memory.is_none() {
             return Commit::Stale;
         }
-        if ctx.state_rev != self.state_rev
-            || !mem_ok
-            || self.active.as_ref().map(|o| o.id.clone()) != ctx.offer_id
-        {
+        if ctx.state_rev != self.state_rev || !mem_ok {
             return Commit::Stale;
         }
         if let Some(seq) = ctx.trigger {
@@ -1623,49 +1058,23 @@ impl Session {
             }
         }
         let mut d = ctx.base.clone();
-        let mut conds = Vec::new();
         match result {
-            ContextualResult::Noul(Ok(v)) => match v {
-                NoulVerdict::Clear { p_yes } => {
-                    d.outcome = Outcome::Proceed;
-                    d.decision_source = "gemini_decisions".into();
-                    d.reason = format!("{} Contextual check clear (p_yes {:.2}).", d.reason, p_yes);
-                }
-                NoulVerdict::Uncertain { p_yes } => {
-                    d.outcome = Outcome::Ask;
-                    d.decision_source = "gemini_decisions".into();
-                    d.reason = format!(
-                        "{} Contextual check uncertain (p_yes {:.2}); review the conversation.",
-                        d.reason, p_yes
-                    );
-                    conds.push((
-                        ConditionKind::ContextualUncertain,
-                        ctx.covers,
-                        format!("contextual check uncertain (p_yes {p_yes:.2})"),
-                    ));
-                }
-                NoulVerdict::Concern { p_yes } => {
-                    d.outcome = Outcome::Ask;
-                    d.decision_source = "gemini_decisions".into();
-                    d.reason = format!(
-                        "{} Possible unaddressed fee or condition (p_yes {:.2}).",
-                        d.reason, p_yes
-                    );
-                    conds.push((
-                        ConditionKind::ContextualConcern,
-                        ctx.covers,
-                        format!("possible unaddressed condition (p_yes {p_yes:.2})"),
-                    ));
-                }
-            },
+            ContextualResult::Judge(Ok(j)) => {
+                let source = if self.providers == "real" {
+                    "gemini_judge"
+                } else {
+                    "mock_judge"
+                };
+                d = Decision::simple(j.outcome, j.reason, source);
+            }
             ContextualResult::Choice(Ok(a)) => {
                 let l = self.lunch.as_ref();
                 d = lunch::decide_with_choice(d, &a, l);
             }
-            ContextualResult::Noul(Err(e)) | ContextualResult::Choice(Err(e)) => {
+            ContextualResult::Judge(Err(e)) | ContextualResult::Choice(Err(e)) => {
                 d = Decision::simple(
                     Outcome::Unavailable,
-                    format!("Contextual check unavailable: {}", e.message),
+                    format!("No decision: {}", e.message),
                     "none",
                 );
                 d.error = Some(e);
@@ -1681,10 +1090,6 @@ impl Session {
             d.decision_source = "mock_decisions".into();
             d.reason = d.reason.replace("Gemini Decisions", "MOCK decisions");
         }
-        if !conds.is_empty() {
-            d.conditions.extend(conds.iter().map(|c| c.2.clone()));
-        }
-        self.add_conditions(conds);
         self.publish(d, ctx.trigger, now_ms);
         Commit::Committed
     }
@@ -1693,202 +1098,36 @@ impl Session {
     // Rules
     // ------------------------------------------------------------------
 
-    fn negotiation_rules(&self) -> Rules {
-        if !self.goals_confirmed {
+    /// The newest applied turns (up to the trigger) that fit the context window, oldest
+    /// first, for the model to judge against the free-text goals.
+    fn judge_rules(&self, trigger: Option<u64>) -> Rules {
+        let upto = trigger.unwrap_or(u64::MAX);
+        let mut lines: Vec<String> = Vec::new();
+        let mut chars = 0;
+        for t in self
+            .turns
+            .iter()
+            .rev()
+            .filter(|t| t.server_seq <= upto && t.effect_applied)
+        {
+            let line = format!("{}: {}", t.speaker.as_deref().unwrap_or("unknown"), t.text);
+            chars += line.chars().count() + 1;
+            if chars > CONTEXT_MAX_CHARS || lines.len() >= CONTEXT_MAX_TURNS {
+                break;
+            }
+            lines.push(line);
+        }
+        if lines.is_empty() {
             return Rules::Idle;
         }
-        let Some(o) = &self.active else {
-            if !self.barriers.is_empty() {
-                return Rules::Final(self.barrier_decision(), vec![]);
-            }
-            if !self.ambiguous.is_empty() {
-                return Rules::Final(self.ambiguous_decision(), vec![]);
-            }
-            return Rules::Final(
-                Decision::simple(Outcome::None, "No offer yet.", "rules"),
-                vec![],
-            );
-        };
-        let stmts = o.stmts();
-        let r = evaluate_requirements(&stmts, &self.goals);
-        let mut violations = Vec::new();
-        let mut unknowns = Vec::new();
-        let mut satisfied = Vec::new();
-        for (name, e) in r.all() {
-            match e {
-                Eval::Violates(m) => violations.push(format!("{name}: {m}")),
-                Eval::Unknown(m) => unknowns.push(format!("{name}: {m}")),
-                Eval::Satisfies(m) => satisfied.push(m.clone()),
-            }
-        }
-        let unconfirmed: Vec<String> = o
-            .facts
-            .iter()
-            .filter(|f| !f.confirmed)
-            .map(|f| f.stmt.describe())
-            .collect();
-        let conditions: Vec<String> = o
-            .unresolved_conditions()
-            .iter()
-            .map(|c| c.note.clone())
-            .collect();
-        let mut base = Decision {
-            outcome: Outcome::Ask,
-            awaiting_confirmation: false,
-            selected_option: None,
-            reason: String::new(),
-            missing: unknowns.clone(),
-            conflicts: violations.clone(),
-            unconfirmed: unconfirmed.clone(),
-            conditions: conditions.clone(),
-            decision_source: "rules".into(),
-            error: None,
-        };
-        if !violations.is_empty() {
-            base.outcome = Outcome::Pause;
-            let mut reason = format!("Pause: {}.", violations.join("; "));
-            if !unknowns.is_empty() {
-                reason.push_str(&format!(" Also missing: {}.", unknowns.join("; ")));
-            }
-            if !unconfirmed.is_empty() {
-                reason.push_str(" (based on unconfirmed extracted terms)");
-            }
-            base.reason = reason;
-            return Rules::Final(base, vec![]);
-        }
-        if !self.barriers.is_empty() {
-            let mut d = self.barrier_decision();
-            d.missing = unknowns;
-            d.unconfirmed = unconfirmed;
-            return Rules::Final(d, vec![]);
-        }
-        // a pending voice-context update blocks positive cues (after PAUSE and barriers)
-        if let Some(mut d) = self.context_gate() {
-            d.missing.extend(unknowns);
-            d.unconfirmed = unconfirmed;
-            d.conditions = conditions;
-            return Rules::Final(d, vec![]);
-        }
-        if !self.ambiguous.is_empty() {
-            unknowns.push(format!(
-                "unclear statement in turn(s) {}",
-                self.ambiguous
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            base.missing = unknowns.clone();
-        }
-        for u in o.open_unresolved() {
-            unknowns.push(format!(
-                "unresolved {} interpretation: {} (\"{}\")",
-                u.field, u.reason, u.excerpt
-            ));
-        }
-        base.missing = unknowns.clone();
-        if !unknowns.is_empty() {
-            base.reason = format!("Ask: {}.", unknowns.join("; "));
-            return Rules::Final(base, vec![]);
-        }
-        if !unconfirmed.is_empty() {
-            base.awaiting_confirmation = true;
-            base.reason = format!(
-                "All required terms stated and within goals ({}); confirm {} extracted term(s).",
-                satisfied.join(", "),
-                unconfirmed.len()
-            );
-            return Rules::Final(base, vec![]);
-        }
-        if !conditions.is_empty() {
-            base.reason = format!("Ask: unresolved condition(s): {}.", conditions.join("; "));
-            return Rules::Final(base, vec![]);
-        }
-        // context window since the last resolution point
-        let window_seqs: Vec<u64> = o
-            .turn_seqs
-            .iter()
-            .copied()
-            .filter(|s| *s > o.resolved_through_seq)
-            .collect();
-        let covers = (
-            window_seqs.first().copied().unwrap_or(o.created_seq),
-            window_seqs.last().copied().unwrap_or(o.created_seq),
-        );
-        let mut texts = Vec::new();
-        let mut missing_turn = false;
-        for s in &window_seqs {
-            match self.turn(*s) {
-                Some(t) => texts.push(t.text.clone()),
-                None => missing_turn = true,
-            }
-        }
-        let window = texts.join("\n");
-        if missing_turn
-            || o.dropped_through > o.resolved_through_seq
-            || window_seqs.len() > CONTEXT_MAX_TURNS
-            || window.chars().count() > CONTEXT_MAX_CHARS
-        {
-            base.reason =
-                "Ask: offer conversation exceeds the verifiable context window; review it.".into();
-            base.conditions.push("context limit reached".into());
-            return Rules::Final(
-                base,
-                vec![(
-                    ConditionKind::ContextLimit,
-                    covers,
-                    "context limit reached".into(),
-                )],
-            );
-        }
-        base.reason = format!("Confirmed: {}.", satisfied.join(", "));
-        let terms = o
-            .facts
-            .iter()
-            .map(|f| format!("- {}", f.stmt.describe()))
-            .collect::<Vec<_>>()
-            .join("\n");
+        lines.reverse();
         Rules::Contextual {
-            base,
-            request: ContextualRequest::Noul { terms, window },
-            covers,
+            base: Decision::simple(Outcome::None, "", "none"),
+            request: ContextualRequest::Judge {
+                goals: self.goals.clone(),
+                conversation: lines.join("\n"),
+            },
         }
-    }
-
-    fn barrier_decision(&self) -> Decision {
-        let list = self
-            .barriers
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut d = Decision::simple(
-            Outcome::Unavailable,
-            format!("Turn(s) {list} were not processed; retry or discard before a recommendation."),
-            "rules",
-        );
-        d.error = Some(ApiError::new(
-            "unresolved_failed_turn",
-            format!("unresolved failed turn(s): {list}"),
-            true,
-        ));
-        d
-    }
-
-    fn ambiguous_decision(&self) -> Decision {
-        let list = self
-            .ambiguous
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut d = Decision::simple(
-            Outcome::Ask,
-            format!("Ask: unclear statement in turn(s) {list}."),
-            "rules",
-        );
-        d.missing = vec![format!("unclear turn(s) {list}")];
-        d
     }
 
     fn lunch_rules(&self, memory: Option<&lunch::MemoryView>) -> Rules {
@@ -1899,7 +1138,7 @@ impl Session {
             return Rules::Idle;
         }
         match lunch::rules(l, memory, &self.barriers, &self.ambiguous) {
-            lunch::LunchRules::Final(d) => Rules::Final(d, vec![]),
+            lunch::LunchRules::Final(d) => Rules::Final(d),
             lunch::LunchRules::Choice {
                 base,
                 soft_prefs,
@@ -1910,7 +1149,6 @@ impl Session {
                     soft_prefs,
                     options,
                 },
-                covers: (0, 0),
             },
         }
     }
@@ -1919,7 +1157,8 @@ impl Session {
     // User actions (all bound to state_rev and object versions)
     // ------------------------------------------------------------------
 
-    pub fn set_goals(&mut self, expected_version: u64, goals: NegGoals) -> Result<(), ApiError> {
+    /// Replace the free-text goals (typed in the companion UI).
+    pub fn set_goals(&mut self, expected_version: u64, goals: String) -> Result<(), ApiError> {
         if self.closed {
             return Err(ApiError::new("session_closed", "session is closed", false));
         }
@@ -1929,274 +1168,16 @@ impl Session {
                 self.goals_version
             )));
         }
+        let goals = goals.trim().to_string();
+        if goals.chars().count() > crate::context::GOALS_MAX_CHARS {
+            return Err(ApiError::new(
+                "goals_too_long",
+                "goals exceed 4000 characters",
+                false,
+            ));
+        }
         self.goals = goals;
-        self.goals_confirmed = true;
         self.goals_version += 1;
-        self.bump_state();
-        self.invalidate();
-        Ok(())
-    }
-
-    pub fn confirm_facts(
-        &mut self,
-        expected_state_rev: u64,
-        offer_id: &str,
-        items: &[(u64, u64)],
-        now_ms: u64,
-    ) -> Result<usize, ApiError> {
-        if expected_state_rev != self.state_rev {
-            return Err(stale("terms changed since this form was loaded"));
-        }
-        let Some(o) = self.active.as_mut() else {
-            return Err(stale("no active offer"));
-        };
-        if o.id != offer_id {
-            return Err(stale("offer was replaced"));
-        }
-        for (id, ver) in items {
-            if !o.facts.iter().any(|f| f.id == *id && f.version == *ver) {
-                return Err(stale("a term changed since this form was loaded"));
-            }
-        }
-        let mut n = 0;
-        for f in o.facts.iter_mut() {
-            if items.iter().any(|(id, _)| *id == f.id) && !f.confirmed {
-                f.confirmed = true;
-                f.version += 1;
-                n += 1;
-            }
-        }
-        o.version += 1;
-        self.record_human_wait(now_ms);
-        self.bump_state();
-        self.invalidate();
-        Ok(n)
-    }
-
-    /// Explicit user correction of a negotiation value: replaces every statement
-    /// in that slot (for price: every amount statement) with one confirmed
-    /// user-entered fact and resolves open interpretations of that field.
-    pub fn correct_value(
-        &mut self,
-        expected_state_rev: u64,
-        offer_id: &str,
-        c: Correction,
-        now_ms: u64,
-    ) -> Result<(), ApiError> {
-        if expected_state_rev != self.state_rev {
-            return Err(stale("terms changed since this form was loaded"));
-        }
-        let id = self.next_fact_id;
-        let Some(o) = self.active.as_mut() else {
-            return Err(stale("no active offer"));
-        };
-        if o.id != offer_id {
-            return Err(stale("offer was replaced"));
-        }
-        let (stmt, field) = match c {
-            Correction::TotalInclDelivery(cents) => (
-                Stmt::Total {
-                    cents,
-                    covers: Covers::AllIn,
-                },
-                "amount",
-            ),
-            Correction::Size(v) if v.is_size() => (
-                Stmt::Size {
-                    negated: false,
-                    value: v,
-                },
-                "size",
-            ),
-            Correction::Firmness(v) if v.is_firmness() => (
-                Stmt::Firmness {
-                    negated: false,
-                    value: v,
-                },
-                "firmness",
-            ),
-            Correction::ReturnNights(n) => (
-                Stmt::Return {
-                    min_nights: n,
-                    max_nights: n,
-                },
-                "returnperiod",
-            ),
-            _ => {
-                return Err(ApiError::new(
-                    "invalid_correction",
-                    "value does not fit the field",
-                    false,
-                ))
-            }
-        };
-        let is_price = field == "amount";
-        o.facts.retain(|f| {
-            let s = f.stmt.slot();
-            if is_price {
-                !matches!(
-                    s,
-                    Slot::Charge(_) | Slot::Total(_) | Slot::Unspecified | Slot::PriceUnresolved
-                )
-            } else {
-                s != stmt.slot()
-            }
-        });
-        o.facts.push(Fact {
-            id,
-            version: 1,
-            stmt,
-            confirmed: true,
-            source_seq: None,
-            excerpt: "user correction".into(),
-            excerpt_truncated: false,
-            byte_range: None,
-            extractor: "user".into(),
-        });
-        for u in o
-            .unresolved
-            .iter_mut()
-            .filter(|u| u.open && u.field == field)
-        {
-            u.open = false;
-            u.version += 1;
-        }
-        o.version += 1;
-        self.next_fact_id += 1;
-        self.record_human_wait(now_ms);
-        self.bump_state();
-        self.invalidate();
-        Ok(())
-    }
-
-    /// Explicitly dismiss an open rejected interpretation ("not a term").
-    pub fn dismiss_unresolved(
-        &mut self,
-        expected_state_rev: u64,
-        offer_id: &str,
-        id: u64,
-        version: u64,
-    ) -> Result<(), ApiError> {
-        if expected_state_rev != self.state_rev {
-            return Err(stale("state changed since this form was loaded"));
-        }
-        let Some(o) = self.active.as_mut() else {
-            return Err(stale("no active offer"));
-        };
-        if o.id != offer_id {
-            return Err(stale("offer was replaced"));
-        }
-        let Some(u) = o
-            .unresolved
-            .iter_mut()
-            .find(|u| u.id == id && u.version == version && u.open)
-        else {
-            return Err(stale("interpretation changed"));
-        };
-        u.open = false;
-        u.version += 1;
-        o.version += 1;
-        self.bump_state();
-        self.invalidate();
-        Ok(())
-    }
-
-    /// Resolve an unclear turn explicitly: apply its validated terms as a new
-    /// offer or as an amendment of the active offer (unconfirmed), or ignore it.
-    pub fn resolve_ambiguous(
-        &mut self,
-        expected_state_rev: u64,
-        seq: u64,
-        how: AmbiguousResolution,
-    ) -> Result<(), ApiError> {
-        if expected_state_rev != self.state_rev {
-            return Err(stale("state changed since this form was loaded"));
-        }
-        if !self.ambiguous.contains(&seq) {
-            return Err(stale("turn is not marked unclear"));
-        }
-        let terms = self
-            .turn(seq)
-            .map(|t| t.pending_terms.clone())
-            .unwrap_or_default();
-        let mk = |id: u64, (stmt, ex, tr): &(Stmt, String, bool)| Fact {
-            id,
-            version: 1,
-            stmt: stmt.clone(),
-            confirmed: false,
-            source_seq: Some(seq),
-            excerpt: ex.clone(),
-            excerpt_truncated: *tr,
-            byte_range: None,
-            extractor: "user-resolved".into(),
-        };
-        match how {
-            AmbiguousResolution::Ignore => {}
-            AmbiguousResolution::NewOffer => {
-                if terms.is_empty() {
-                    return Err(ApiError::new(
-                        "no_terms",
-                        "the unclear turn has no usable terms",
-                        false,
-                    ));
-                }
-                let id = self.offer_id(self.next_offer_no);
-                self.next_offer_no += 1;
-                let mut facts = Vec::new();
-                for t in &terms {
-                    facts.push(mk(self.next_fact_id, t));
-                    self.next_fact_id += 1;
-                }
-                if let Some(old) = self.active.take() {
-                    self.archive(old);
-                }
-                self.active = Some(Offer {
-                    id,
-                    version: 1,
-                    facts,
-                    conditions: vec![],
-                    created_seq: seq,
-                    turn_seqs: vec![seq],
-                    resolved_through_seq: seq.saturating_sub(1),
-                    dropped_through: 0,
-                    unresolved: vec![],
-                });
-            }
-            AmbiguousResolution::Amendment => {
-                if terms.is_empty() {
-                    return Err(ApiError::new(
-                        "no_terms",
-                        "the unclear turn has no usable terms",
-                        false,
-                    ));
-                }
-                let mut next = self.next_fact_id;
-                let Some(o) = self.active.as_mut() else {
-                    return Err(stale("no active offer to amend"));
-                };
-                let touched: BTreeSet<Slot> = terms.iter().map(|t| t.0.slot()).collect();
-                let keep = o
-                    .facts
-                    .iter()
-                    .filter(|f| !touched.contains(&f.stmt.slot()))
-                    .count();
-                if keep + terms.len() > FACTS_PER_OFFER {
-                    return Err(ApiError::new(
-                        "offer_full",
-                        "offer fact limit reached",
-                        false,
-                    ));
-                }
-                o.facts.retain(|f| !touched.contains(&f.stmt.slot()));
-                for t in &terms {
-                    o.facts.push(mk(next, t));
-                    next += 1;
-                }
-                o.version += 1;
-                self.next_fact_id = next;
-            }
-        }
-        self.ambiguous.remove(&seq);
         self.bump_state();
         self.invalidate();
         Ok(())
@@ -2211,41 +1192,6 @@ impl Session {
             return Err(stale("no failed evaluation to retry"));
         }
         self.eval_failed = None;
-        self.invalidate();
-        Ok(())
-    }
-
-    pub fn resolve_condition(
-        &mut self,
-        expected_state_rev: u64,
-        offer_id: &str,
-        cond_id: u64,
-        version: u64,
-    ) -> Result<(), ApiError> {
-        if expected_state_rev != self.state_rev {
-            return Err(stale("state changed since this form was loaded"));
-        }
-        let Some(o) = self.active.as_mut() else {
-            return Err(stale("no active offer"));
-        };
-        if o.id != offer_id {
-            return Err(stale("offer was replaced"));
-        }
-        let Some(c) = o
-            .conditions
-            .iter_mut()
-            .find(|c| c.id == cond_id && c.version == version)
-        else {
-            return Err(stale("condition changed"));
-        };
-        if c.status != ConditionStatus::Unresolved {
-            return Err(stale("condition already resolved"));
-        }
-        c.status = ConditionStatus::ResolvedByUser;
-        c.version += 1;
-        o.resolved_through_seq = o.resolved_through_seq.max(c.covers.1);
-        o.version += 1;
-        self.bump_state();
         self.invalidate();
         Ok(())
     }
@@ -2359,23 +1305,6 @@ impl Session {
         self.bump_state();
     }
 
-    pub fn active_offer_text(&self) -> String {
-        match &self.active {
-            None => "none".into(),
-            Some(o) => {
-                let cost = evaluate_cost(&o.stmts(), self.goals.budget_cents).1;
-                format!(
-                    "{} (lower bound {}, exact {})",
-                    o.id,
-                    fmt_cents(cost.lower_bound),
-                    cost.exact
-                        .map(fmt_cents)
-                        .unwrap_or_else(|| "unknown".into())
-                )
-            }
-        }
-    }
-
     pub fn excerpt_of(text: &str) -> String {
         excerpt(text).0
     }
@@ -2383,54 +1312,9 @@ impl Session {
 
 pub enum Rules {
     Idle,
-    Final(Decision, Vec<(ConditionKind, (u64, u64), String)>),
+    Final(Decision),
     Contextual {
         base: Decision,
         request: ContextualRequest,
-        covers: (u64, u64),
     },
-}
-
-/// User correction of one negotiation value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Correction {
-    TotalInclDelivery(u64),
-    Size(EnumValue),
-    Firmness(EnumValue),
-    ReturnNights(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AmbiguousResolution {
-    Ignore,
-    NewOffer,
-    Amendment,
-}
-
-fn rejected_lines(rejected: &[RejectedTerm]) -> Vec<String> {
-    rejected
-        .iter()
-        .take(LIST_MAX_ENTRIES)
-        .map(|r| bounded(&format!("{} ({})", r.reason, r.excerpt), 240).0)
-        .collect()
-}
-
-/// Explicit wording that keeps the active offer's other terms.
-pub const KEEP_TERMS_MARKERS: &[&str] = &[
-    "same offer",
-    "same deal",
-    "keep all other terms",
-    "keep the other terms",
-    "keep everything else",
-    "everything else stays",
-    "everything else the same",
-    "all other terms stay",
-    "other terms stay",
-    "rest stays the same",
-    "otherwise the same",
-];
-
-pub fn keeps_other_terms(transcript: &str) -> bool {
-    let n = crate::text::normalize(transcript);
-    KEEP_TERMS_MARKERS.iter().any(|m| n.contains(m))
 }

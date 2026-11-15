@@ -6,15 +6,10 @@ use crate::memory::{Change, SaveResult};
 use axum::extract::{Form, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use copilot_core::context::{CtxAcceptReq, CtxStatus, TRIGGER_TYPED};
 use copilot_core::contract::{ApiError, Mode};
 use copilot_core::distance::{DistUnit, Distance};
 use copilot_core::lunch::{self, Allergen, AllergenStatus, Diet, LunchField, PrefKind, Strength};
-use copilot_core::money::{fmt_cents, parse_amount_text};
-use copilot_core::negotiation::{EnumValue, NegGoals};
-use copilot_core::session::{
-    AcceptReq, AmbiguousResolution, ConditionStatus, Correction, Session, TurnStatus,
-};
+use copilot_core::session::{AcceptReq, Session, TurnStatus};
 use maud::{html, Markup, DOCTYPE};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -65,7 +60,7 @@ fn provider_banner(app: &App) -> Markup {
     html! {
         @match l {
             "mock" => div.banner.mock { "MOCK PROVIDERS — deterministic stand-ins; not Gemini. Results are not evidence of provider integration." },
-            "real" => div.banner.real { "Providers: Gemini extraction (generateContent) + Gemini Decisions (server-side)." },
+            "real" => div.banner.real { "Providers: Gemini generateContent (negotiation judge, lunch extraction) + Gemini Decisions (lunch choice), server-side." },
             _ => div.banner.unconf { "Providers UNCONFIGURED — GEMINI_API_KEY not set; turns will be UNAVAILABLE." },
         }
     }
@@ -97,11 +92,7 @@ fn status_inner(app: &App, h: &SessionHandle, seen: Option<u64>) -> Markup {
     let snap = s.snapshot("ui");
     let latest = s.latest_turn().cloned();
     let pending_confirm = s
-        .active
-        .as_ref()
-        .map(|o| o.facts.iter().filter(|f| !f.confirmed).count())
-        .unwrap_or(0)
-        + s.lunch
+        .lunch
             .as_ref()
             .map(|l| {
                 l.options
@@ -157,45 +148,6 @@ pub async fn status(State(app): State<Arc<App>>, Query(q): Query<SeenQ>) -> Html
     )
 }
 
-const CORRECT_FIELDS: &[(&str, &str)] = &[
-    ("total", "total incl. delivery ($)"),
-    ("size", "size (twin/full/queen/king/cal_king)"),
-    ("firmness", "firmness (soft/medium/firm/extra_firm)"),
-    ("return", "return nights"),
-];
-
-fn terms_table(s: &Session, app: &App) -> Markup {
-    html! {
-        @if let Some(o) = &s.active {
-            p { b { "Active offer " (o.id) } " · " (s.active_offer_text()) }
-            table { tr { th { "Term" } th { "Status" } th { "Evidence (excerpt)" } th { "Source" } }
-                @for f in &o.facts { tr {
-                    td { (f.stmt.describe()) }
-                    td { @if f.confirmed { span.ok { "confirmed" } } @else { "unconfirmed" } }
-                    td { "“" (f.excerpt) "”" @if f.excerpt_truncated { " (truncated)" } }
-                    td.muted { @if let Some(seq) = f.source_seq { "turn " (seq) } " · " (f.extractor) " · v" (f.version) }
-                } } }
-            @for u in o.open_unresolved() {
-                form method="post" action="/ui/unresolved/dismiss" { (bind(app, s))
-                    input type="hidden" name="offer_id" value=(o.id); input type="hidden" name="id" value=(u.id); input type="hidden" name="version" value=(u.version);
-                    span.err { "Unresolved " (u.field) ": " (u.reason) } " “" (u.excerpt) "” " button { "Not a term — dismiss" } }
-            }
-            @for c in &o.conditions { @if c.status == ConditionStatus::Unresolved {
-                form method="post" action="/ui/condition/resolve" { (bind(app, s))
-                    input type="hidden" name="offer_id" value=(o.id);
-                    input type="hidden" name="cond_id" value=(c.id); input type="hidden" name="version" value=(c.version);
-                    "Condition: " (c.note) " (turns " (c.covers.0) "–" (c.covers.1) ") " button { "Reviewed — no extra terms" } }
-            } }
-            form method="post" action="/ui/correct" { (bind(app, s)) input type="hidden" name="offer_id" value=(o.id);
-                "Correct a value: " select name="field" { @for (k, label) in CORRECT_FIELDS { option value=(k) { (label) } } }
-                " " input name="value" size="10"; " " button { "Save correction (confirmed)" } }
-        } @else { p.muted { "No offer yet." } }
-        @if let Some(e) = &s.eval_failed {
-            form method="post" action="/ui/eval/retry" { (bind(app, s)) span.err { "Evaluation failed: " (e.code) " " } button { "Retry evaluation" } }
-        }
-    }
-}
-
 fn turn_controls(s: &Session, app: &App) -> Markup {
     html! {
         @for t in s.turns.iter().rev().take(12) {
@@ -212,11 +164,7 @@ fn turn_controls(s: &Session, app: &App) -> Markup {
                     }
                     @if s.ambiguous.contains(&t.server_seq) {
                         form method="post" action="/ui/ambiguous/resolve" { (bind(app, s)) input type="hidden" name="seq" value=(t.server_seq);
-                            button name="how" value="ignore" { "Ignore" } " "
-                            @if !t.pending_terms.is_empty() {
-                                button name="how" value="new_offer" { "Treat as new offer" } " "
-                                button name="how" value="amendment" { "Treat as amendment" }
-                            } }
+                            button { "Ignore" } }
                     }
                 }
             }
@@ -224,44 +172,12 @@ fn turn_controls(s: &Session, app: &App) -> Markup {
     }
 }
 
-fn context_panel(s: &Session, app: &App) -> Markup {
-    html! {
-        p.muted { "Gesture-triggered goal updates. Nothing changes until you confirm the exact proposal below." }
-        @if let Some(c) = &s.context {
-            p { b { "Update " (c.update_id) } " (" (c.input_source) ", " (c.transcript_source) ", attempt " (c.attempt) "): “" (Session::excerpt_of(&c.text)) "” · " b { (format!("{:?}", c.status).to_uppercase()) }
-                @if let Some(e) = &c.error { " · " span.err { (e.code) ": " (e.message) } } }
-            @if !c.changes.is_empty() {
-                table { tr { th { "Goal" } th { "Current" } th { "Proposed" } th { "Evidence (excerpt)" } }
-                    @for ch in &c.changes { tr { td { (format!("{:?}", ch.value.field()).to_lowercase()) } td { (ch.old) } td { (ch.new) } td { "“" (ch.quote) "”" } } } }
-            }
-            @for r in &c.rejected { p.muted { "not proposed: " (r) } }
-            @if c.status == CtxStatus::Proposed {
-                form method="post" action="/ui/context/confirm" { (bind(app, s)) input type="hidden" name="update_id" value=(c.update_id); input type="hidden" name="proposal_version" value=(c.proposal_version);
-                    button { "Confirm these goal changes (v" (c.proposal_version) ")" } }
-            }
-            @if matches!(c.status, CtxStatus::Failed | CtxStatus::Stale | CtxStatus::Proposed) {
-                form method="post" action="/ui/context/retry" { (bind(app, s)) input type="hidden" name="update_id" value=(c.update_id); button { "Retry extraction" } }
-            }
-            @if c.status.is_open() {
-                form method="post" action="/ui/context/discard" { (bind(app, s)) input type="hidden" name="update_id" value=(c.update_id); button { "Discard (goals unchanged)" } }
-            }
-        }
-        form method="post" action="/ui/context" { (bind(app, s)) input type="hidden" name="nonce" value=(uuid::Uuid::new_v4().simple());
-            "Typed voice update (stand-in for the gesture + transcript; labelled typed or simulated): " input name="text" size="50" placeholder="My budget is now $1,300 including delivery."; " " button { "Submit as context update" } }
-    }
-}
-
 fn goals_form(s: &Session, app: &App) -> Markup {
-    let g = &s.goals;
     html! {
         form method="post" action="/ui/goals" { (bind(app, s)) input type="hidden" name="goals_version" value=(s.goals_version);
-            "Size " select name="size" { @for v in ["twin","full","queen","king","cal_king"] { option value=(v) selected[g.sizes.first().map(|x| x.label().replace(' ', "_")) == Some(v.to_string())] { (v) } } }
-            " Firmness " select name="firmness" { @for v in ["soft","medium","firm","extra_firm"] { option value=(v) selected[g.firmness.first().map(|x| x.label().replace(' ', "_")) == Some(v.to_string())] { (v) } } }
-            " Budget incl. delivery $" input name="budget" size="6" value=(g.budget_cents / 100);
-            " Min return nights " input name="nights" size="4" value=(g.min_return_nights);
-            " " button { @if s.goals_confirmed { "Update and confirm goals" } @else { "Confirm goals" } }
-            @if s.goals_confirmed { span.ok { " confirmed: " (g.sizes.iter().map(|v| v.label()).collect::<Vec<_>>().join("/")) ", " (g.firmness.iter().map(|v| v.label()).collect::<Vec<_>>().join("/")) ", ≤ " (fmt_cents(g.budget_cents)) " incl. delivery, ≥ " (g.min_return_nights) " nights" } }
-        }
+            textarea name="goals" placeholder="Your goals for this conversation, in your own words." { (s.goals) }
+            button { "Save goals" } }
+        p.muted { "Optional, any wording: the copilot works out your requirements from these goals and from what you say in the conversation. Speech between three waves on the band is added here." }
     }
 }
 
@@ -335,14 +251,14 @@ pub async fn index(State(app): State<Arc<App>>) -> Html<String> {
             div.row {
                 div.card { h2 { "Goals" }
                     @if h.mode == Mode::Negotiation { (goals_form(&s, &app)) } @else { (lunch_setup(&s, &app)) } }
-            @if h.mode == Mode::Negotiation && s.goals_confirmed { div.card { h2 { "Voice context update" } (context_panel(&s, &app)) } }
                 div.card { h2 { "Typed turn (simulated input)" }
                     form method="post" action="/ui/turn" { (bind(&app, &s)) input type="hidden" name="nonce" value=(uuid::Uuid::new_v4().simple().to_string());
-                        textarea name="text" placeholder="e.g. Best I can do is $1,150 delivered, queen, firm, with a 100-night return." {}
+                        textarea name="text" placeholder="e.g. Our firm queen is $1,150 delivered, with a 100-night trial." {}
                         button { "Submit turn" } }
                     p.muted { "Recording/transcription disclosure applies to the band path (Cy's bridge); typed turns are labelled simulated." } }
             }
-            @if h.mode == Mode::Negotiation { div.card { h2 { "Terms " a href="/confirm" { "(confirm)" } } (terms_table(&s, &app)) } }
+            @if let Some(e) = &s.eval_failed { div.card {
+                form method="post" action="/ui/eval/retry" { (bind(&app, &s)) span.err { "Evaluation failed: " (e.code) " " } button { "Retry evaluation" } } } }
             @if h.mode == Mode::Lunch { div.card { h2 { "Preferences (confirmed memory)" } (memory_section(&app)) } }
             div.card { h2 { "Turns" } table { tr { th { "#" } th { "input" } th { "text" } th { "status" } th { "" } } (turn_controls(&s, &app)) } }
         }
@@ -360,18 +276,7 @@ fn confirm_body(app: &App) -> Markup {
     };
     let s = h.state.lock().expect("session").clone();
     html! {
-        h1 { "Confirm extracted terms" } (provider_banner(app))
-        @if let Some(o) = &s.active {
-            @let pending: Vec<_> = o.facts.iter().filter(|f| !f.confirmed).collect();
-            @if pending.is_empty() { p { "Nothing to confirm for offer " (o.id) "." } } @else {
-                form method="post" action="/ui/confirm" { (bind(app, &s)) input type="hidden" name="offer_id" value=(o.id);
-                    input type="hidden" name="items" value=(pending.iter().map(|f| format!("{}:{}", f.id, f.version)).collect::<Vec<_>>().join(","));
-                    table { tr { th { "Term" } th { "Evidence" } th { "Source" } }
-                        @for f in &pending { tr { td { (f.stmt.describe()) } td { "“" (f.excerpt) "”" } td.muted { "turn " (f.source_seq.unwrap_or(0)) " · " (f.extractor) } } } }
-                    button { "Confirm all shown (" (pending.len()) ")" } }
-            }
-            @if !o.open_unresolved().is_empty() { p.err { "Open unresolved interpretations still block a recommendation; correct or dismiss them on the main page." } }
-        }
+        h1 { "Confirm extracted lunch facts" } (provider_banner(app))
         @if let Some(l) = &s.lunch {
             @let pending: Vec<_> = l.options.iter().flat_map(|o| o.facts.iter().filter(|f| !f.confirmed).map(move |f| (o, f))).collect();
             @if !pending.is_empty() {
@@ -532,25 +437,7 @@ pub async fn post_close(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -
 
 pub async fn post_goals(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
     let sh = session!(app, h, f);
-    let size = f
-        .get("size")
-        .and_then(|v| EnumValue::parse_label(v))
-        .filter(|v| v.is_size());
-    let firm = f
-        .get("firmness")
-        .and_then(|v| EnumValue::parse_label(v))
-        .filter(|v| v.is_firmness());
-    let budget: Option<u64> = num(&f, "budget").filter(|b| *b > 0 && *b <= 1_000_000);
-    let nights: Option<u32> = num(&f, "nights").filter(|n| *n <= 3650);
-    let (Some(size), Some(firm), Some(budget), Some(nights)) = (size, firm, budget, nights) else {
-        return error_page(StatusCode::UNPROCESSABLE_ENTITY, "invalid goals");
-    };
-    let goals = NegGoals {
-        sizes: vec![size],
-        firmness: vec![firm],
-        budget_cents: budget * 100,
-        min_return_nights: nights,
-    };
+    let goals = f.get("goals").cloned().unwrap_or_default();
     let gv = num(&f, "goals_version").unwrap_or(0);
     mutate(&app, &sh, |s| s.set_goals(gv, goals))
 }
@@ -594,94 +481,6 @@ pub async fn post_turn(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) ->
     }
 }
 
-fn parse_items(f: &Fields) -> Vec<(u64, u64)> {
-    f.get("items")
-        .map(|v| {
-            v.split(',')
-                .filter_map(|p| p.split_once(':'))
-                .filter_map(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
-                .take(64)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-pub async fn post_confirm(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
-    let sh = session!(app, h, f);
-    let items = parse_items(&f);
-    let offer = f.get("offer_id").cloned().unwrap_or_default();
-    let now = app.now_ms();
-    mutate(&app, &sh, |s| {
-        s.confirm_facts(rev(&f), &offer, &items, now).map(|_| ())
-    })
-}
-
-pub async fn post_correct(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
-    let sh = session!(app, h, f);
-    let v = f
-        .get("value")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let c = match f.get("field").map(String::as_str) {
-        Some("total") => parse_amount_text(&v).map(Correction::TotalInclDelivery),
-        Some("size") => EnumValue::parse_label(&v)
-            .filter(|e| e.is_size())
-            .map(Correction::Size),
-        Some("firmness") => EnumValue::parse_label(&v)
-            .filter(|e| e.is_firmness())
-            .map(Correction::Firmness),
-        Some("return") => v
-            .parse::<u32>()
-            .ok()
-            .filter(|n| *n <= 3650)
-            .map(Correction::ReturnNights),
-        _ => None,
-    };
-    let Some(c) = c else {
-        return error_page(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "value does not fit the field",
-        );
-    };
-    let offer = f.get("offer_id").cloned().unwrap_or_default();
-    let now = app.now_ms();
-    mutate(&app, &sh, |s| s.correct_value(rev(&f), &offer, c, now))
-}
-
-pub async fn post_unresolved_dismiss(
-    State(app): State<Arc<App>>,
-    h: HeaderMap,
-    Form(f): F,
-) -> Response {
-    let sh = session!(app, h, f);
-    let offer = f.get("offer_id").cloned().unwrap_or_default();
-    mutate(&app, &sh, |s| {
-        s.dismiss_unresolved(
-            rev(&f),
-            &offer,
-            num(&f, "id").unwrap_or(0),
-            num(&f, "version").unwrap_or(0),
-        )
-    })
-}
-
-pub async fn post_resolve_condition(
-    State(app): State<Arc<App>>,
-    h: HeaderMap,
-    Form(f): F,
-) -> Response {
-    let sh = session!(app, h, f);
-    let offer = f.get("offer_id").cloned().unwrap_or_default();
-    mutate(&app, &sh, |s| {
-        s.resolve_condition(
-            rev(&f),
-            &offer,
-            num(&f, "cond_id").unwrap_or(0),
-            num(&f, "version").unwrap_or(0),
-        )
-    })
-}
-
 pub async fn post_discard(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
     let sh = session!(app, h, f);
     mutate(&app, &sh, |s| {
@@ -691,14 +490,8 @@ pub async fn post_discard(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F)
 
 pub async fn post_ambiguous(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
     let sh = session!(app, h, f);
-    let how = match f.get("how").map(String::as_str) {
-        Some("new_offer") => AmbiguousResolution::NewOffer,
-        Some("amendment") => AmbiguousResolution::Amendment,
-        Some("ignore") => AmbiguousResolution::Ignore,
-        _ => return error_page(StatusCode::UNPROCESSABLE_ENTITY, "choose how to resolve"),
-    };
     mutate(&app, &sh, |s| {
-        s.resolve_ambiguous(rev(&f), num(&f, "seq").unwrap_or(0), how)
+        s.dismiss_ambiguous(rev(&f), num(&f, "seq").unwrap_or(0))
     })
 }
 
@@ -1023,59 +816,4 @@ pub async fn post_memory_new_profile(
         .new_profile(f.get("fingerprint").cloned().unwrap_or_default())
         .await;
     save_result(&app, r)
-}
-
-// ---------------------------------------------------------------------------
-// Voice-context updates (negotiation only)
-// ---------------------------------------------------------------------------
-
-/// Typed SIMULATED context update: same admission path as the bridge.
-pub async fn post_context(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
-    let sh = session!(app, h, f);
-    let nonce = f.get("nonce").cloned().unwrap_or_default();
-    let req = CtxAcceptReq {
-        mode: sh.mode,
-        source_id: "ui".into(),
-        update_id: format!("ui-ctx-{}", copilot_core::text::bounded(&nonce, 64).0),
-        source_seq: None,
-        trigger: TRIGGER_TYPED.into(),
-        text: f.get("text").cloned().unwrap_or_default(),
-        transcript_source: "typed".into(),
-        input_source: if h.contains_key("x-copilot-simulated") {
-            "simulated".into()
-        } else {
-            "typed".into()
-        },
-        now_ms: app.now_ms(),
-    };
-    mutate(&app, &sh, |s| s.accept_context(req).map(|_| ()))
-}
-
-pub async fn post_context_confirm(
-    State(app): State<Arc<App>>,
-    h: HeaderMap,
-    Form(f): F,
-) -> Response {
-    let sh = session!(app, h, f);
-    let uid = f.get("update_id").cloned().unwrap_or_default();
-    mutate(&app, &sh, |s| {
-        s.confirm_context(rev(&f), &uid, num(&f, "proposal_version").unwrap_or(0))
-    })
-}
-
-pub async fn post_context_discard(
-    State(app): State<Arc<App>>,
-    h: HeaderMap,
-    Form(f): F,
-) -> Response {
-    let sh = session!(app, h, f);
-    let uid = f.get("update_id").cloned().unwrap_or_default();
-    mutate(&app, &sh, |s| s.discard_context(rev(&f), &uid))
-}
-
-pub async fn post_context_retry(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
-    let sh = session!(app, h, f);
-    let uid = f.get("update_id").cloned().unwrap_or_default();
-    let now = app.now_ms();
-    mutate(&app, &sh, |s| s.retry_context(rev(&f), &uid, now))
 }

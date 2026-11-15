@@ -49,7 +49,6 @@ async fn main() {
             data_dir,
             bridge_token,
             providers_label: label.clone(),
-            voice_goals_auto: std::env::var("COPILOT_VOICE_GOALS").as_deref() == Ok("auto"),
         },
         extractor,
         decider,
