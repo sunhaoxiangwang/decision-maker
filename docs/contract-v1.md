@@ -24,6 +24,7 @@ Leo's app (this repository) decides and publishes cues. Cy's bridge captures aud
 | `GET /v1/diagnostics/occupancy` | Retention and admission counters (used by the stress check) |
 | `POST /v1/sessions/{sid}/context-updates` | Voice context update after the three-wave gesture (negotiation only); returns `context_update_result` within 15 s (`PENDING` if still running) |
 | `GET /v1/sessions/{sid}/context-updates/{update_id}` | Look up a context update (`context_update_result`, or 404 `not_accepted`) |
+| `POST /v1/sessions` | Only with `COPILOT_VOICE_GOALS=auto`: start a negotiation session (or return the active one) as `session_info`; otherwise 403 `sessions_ui_only` |
 
 ## Turn request
 
@@ -113,3 +114,12 @@ Cy reports durations measured on the bridge's own monotonic clock (never absolut
 | 429 | `turn_queue_full`, `too_many_pollers` |
 | 503 | `server_busy` (64 requests in flight, including waiting polls), `request_timeout` (20 s; polls 25 s), `bridge_disabled` |
 | 200 + `UNAVAILABLE` | `missing_credentials`, `extraction_*`, `decision_*`, `provider_invalid_output`, `job_deadline`, `queue_timeout`, `capacity_unavailable`, `unresolved_failed_turn`, `memory_recovery_required` |
+
+## Spoken goals without confirmation (`COPILOT_VOICE_GOALS=auto`)
+
+Off by default. With it set on the server:
+
+- The bridge may start the negotiation session (`POST /v1/sessions`), so no companion-UI step is needed.
+- Voice context updates are accepted before any goals exist and are **applied at once** (`status: APPLIED`), never left as proposals.
+- The first updates set the goals: each stated field replaces the placeholder. Turns are decided (no `412 goals_unconfirmed`) once size, firmness, budget and return period have all been stated; until then the result's `proposal.rejected` lists `still needed before decisions: …`.
+- Later updates change only the fields they state. All of Leo's extraction checks still apply: explicit absolute values only, quotes must appear in the transcript, relative changes ("$100 more") are rejected.

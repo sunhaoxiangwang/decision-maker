@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useRef } from 'react';
 import { selectedTurn, visibleTurns, type State } from '@/lib/store';
-import CueBadge, { CUES, CueScale } from './CueBadge';
+import CueBadge, { CueScale } from './CueBadge';
 
 // Speech on the right (the band wearer, speaker 0, in a darker bubble); the copilot's answer
 // on the left: what it was given (collapsed), then its decision under the band colours.
@@ -27,7 +27,7 @@ export default function Conversation({ state, onPick }: { state: State; onPick: 
               </button>
             )}
             {cue && (
-              <article className="agent" style={{ ['--cue' as string]: CUES[cue]?.color ?? 'var(--line)' }}>
+              <article className="agent">
                 {d && (d.context?.length || d.memory_used.length > 0) ? (
                   <details className="agent-context">
                     <summary>Context</summary>

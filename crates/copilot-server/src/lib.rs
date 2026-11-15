@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub fn router(app: Arc<App>) -> Router {
     let bridge = Router::new()
         .route("/v1/sessions/active", get(api::get_active))
+        .route("/v1/sessions", post(api::post_session))
         .route("/v1/sessions/{sid}/turns", post(api::post_turn))
         .route("/v1/sessions/{sid}/turns/{cid}", get(api::get_turn))
         .route(
@@ -267,6 +268,7 @@ pub async fn spawn(
             data_dir,
             bridge_token,
             providers_label: label.into(),
+            voice_goals_auto: false,
         },
         extractor,
         decider,

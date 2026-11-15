@@ -425,6 +425,11 @@ pub struct Session {
     pub context: Option<crate::context::ContextUpdate>,
     pub context_history: VecDeque<crate::context::ContextUpdate>,
     pub context_proposals: u64,
+    /// COPILOT_VOICE_GOALS=auto: wave updates apply without confirmation, and the first
+    /// updates set the goals (decisions start once all four have been stated).
+    pub auto_goals: bool,
+    /// Goal fields stated by voice while goals were still unset (auto mode).
+    pub stated_goals: Vec<crate::context::CtxField>,
 }
 
 fn stale(msg: &str) -> ApiError {
@@ -472,6 +477,8 @@ impl Session {
             context: None,
             context_history: VecDeque::new(),
             context_proposals: 0,
+            auto_goals: false,
+            stated_goals: Vec::new(),
         }
     }
 

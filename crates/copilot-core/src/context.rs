@@ -564,7 +564,7 @@ impl Session {
                 "transcript exceeds 4000 characters",
             ));
         }
-        if !self.goals_confirmed {
+        if !self.goals_confirmed && !self.auto_goals {
             return Err(conflict(
                 "goals_unconfirmed",
                 "confirm goals before updating them by voice",
@@ -719,8 +719,54 @@ impl Session {
         }
         if proposed {
             self.context_proposals = next_proposal;
+            if self.auto_goals {
+                self.auto_apply_context();
+            }
         }
         self.context_transition();
+    }
+
+    /// Auto mode: apply the proposal just made, as if the user had confirmed it. While goals
+    /// are unset, the stated fields replace the placeholders; goals count as set (and turns
+    /// are decided) once size, firmness, budget and return period have all been stated.
+    fn auto_apply_context(&mut self) {
+        let c = self.context.as_ref().expect("current").clone();
+        let mut g = self.goals.clone();
+        for ch in &c.changes {
+            ch.value.apply(&mut g);
+        }
+        if let Err(e) = validate_goals(&g) {
+            let cur = self.context.as_mut().expect("current");
+            cur.status = CtxStatus::Failed;
+            cur.error = Some(ApiError::new("context_invalid_goals", e, false));
+            return;
+        }
+        self.goals = g;
+        if !self.goals_confirmed {
+            for ch in &c.changes {
+                if !self.stated_goals.contains(&ch.value.field()) {
+                    self.stated_goals.push(ch.value.field());
+                }
+            }
+            self.goals_confirmed = self.stated_goals.len() == 4;
+        }
+        self.goals_version += 1;
+        let missing: Vec<&str> = [
+            (CtxField::Size, "size"),
+            (CtxField::Firmness, "firmness"),
+            (CtxField::Budget, "budget"),
+            (CtxField::ReturnPeriod, "return_period"),
+        ]
+        .into_iter()
+        .filter(|(f, _)| !self.goals_confirmed && !self.stated_goals.contains(f))
+        .map(|(_, name)| name)
+        .collect();
+        let cur = self.context.as_mut().expect("current");
+        cur.status = CtxStatus::Applied;
+        cur.error = None;
+        if !missing.is_empty() {
+            cur.rejected.push(format!("still needed before decisions: {}", missing.join(", ")));
+        }
     }
 
     /// Worker-side failure (capacity, deadline) for the current attempt.

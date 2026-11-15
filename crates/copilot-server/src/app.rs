@@ -49,6 +49,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub bridge_token: Option<String>,
     pub providers_label: String,
+    /// COPILOT_VOICE_GOALS=auto: spoken goal updates apply without confirmation, and the
+    /// bridge may start a negotiation session (otherwise only the companion UI does).
+    pub voice_goals_auto: bool,
 }
 
 pub struct App {
@@ -137,7 +140,8 @@ impl App {
     /// Create a new active session; the previous one is closed.
     pub fn create_session(self: &Arc<Self>, mode: Mode) -> Arc<SessionHandle> {
         let id = uuid::Uuid::new_v4().to_string();
-        let s = Session::new(&id, mode, &self.instance_id, &self.cfg.providers_label);
+        let mut s = Session::new(&id, mode, &self.instance_id, &self.cfg.providers_label);
+        s.auto_goals = self.cfg.voice_goals_auto;
         let snap = Arc::new(s.snapshot("init"));
         let (tx, _) = watch::channel(snap);
         let h = Arc::new(SessionHandle {
