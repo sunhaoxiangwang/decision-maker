@@ -3,6 +3,7 @@
 //! must never be presented as a working provider integration.
 
 use crate::{BoxFut, Decider, ExtractOutput, ExtractRequest, Extractor};
+use copilot_core::context::{CtxExtraction, CtxField, RawCtxChange};
 use copilot_core::contextual::{ChoiceAnswer, NoulVerdict};
 use copilot_core::contract::{ApiError, Mode};
 use copilot_core::lunch::{
@@ -364,6 +365,13 @@ impl Extractor for MockExtractor {
     fn name(&self) -> &str {
         "mock-extractor"
     }
+    fn extract_context(
+        &self,
+        transcript: String,
+        _goals: String,
+    ) -> BoxFut<'_, Result<CtxExtraction, ApiError>> {
+        Box::pin(async move { Ok(mock_context(&transcript)) })
+    }
     fn extract(&self, req: ExtractRequest) -> BoxFut<'_, Result<ExtractOutput, ApiError>> {
         Box::pin(async move {
             Ok(match req.mode {
@@ -461,6 +469,8 @@ pub enum Scripted<T> {
 
 pub struct ScriptedExtractor {
     pub queue: Mutex<VecDeque<Scripted<ExtractOutput>>>,
+    /// Scripted voice-context extractions (falls back to the MOCK when empty).
+    pub context_queue: Mutex<VecDeque<Scripted<CtxExtraction>>>,
     pub calls: std::sync::atomic::AtomicUsize,
     pub fallback: bool,
 }
@@ -469,6 +479,7 @@ impl ScriptedExtractor {
     pub fn new(items: Vec<Scripted<ExtractOutput>>) -> ScriptedExtractor {
         ScriptedExtractor {
             queue: Mutex::new(items.into()),
+            context_queue: Mutex::new(VecDeque::new()),
             calls: Default::default(),
             fallback: true,
         }
@@ -498,6 +509,18 @@ fn run_script<T: Send + 'static>(s: Scripted<T>) -> BoxFut<'static, Result<T, Ap
 impl Extractor for ScriptedExtractor {
     fn name(&self) -> &str {
         "scripted-mock-extractor"
+    }
+    fn extract_context(
+        &self,
+        transcript: String,
+        goals: String,
+    ) -> BoxFut<'_, Result<CtxExtraction, ApiError>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let next = self.context_queue.lock().expect("lock").pop_front();
+        match next {
+            Some(s) => run_script(s),
+            None => MockExtractor.extract_context(transcript, goals),
+        }
     }
     fn extract(&self, req: ExtractRequest) -> BoxFut<'_, Result<ExtractOutput, ApiError>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -557,6 +580,36 @@ impl Decider for ScriptedDecider {
             None => MockDecider.choice(s, o),
         }
     }
+}
+
+/// MOCK voice-context extraction: the MOCK negotiation reader mapped onto goal
+/// fields. Deterministic; never evidence of provider behaviour.
+pub fn mock_context(transcript: &str) -> CtxExtraction {
+    let ext = mock_negotiation(transcript, None);
+    let changes = ext
+        .terms
+        .into_iter()
+        .filter_map(|t| {
+            let field = match t.field {
+                TermField::Amount if t.currency == Currency::Usd && t.amount_text.is_some() => {
+                    CtxField::Budget
+                }
+                TermField::Size if t.predicate == Predicate::Is => CtxField::Size,
+                TermField::Firmness if t.predicate == Predicate::Is => CtxField::Firmness,
+                TermField::ReturnPeriod if t.predicate == Predicate::Is => CtxField::ReturnPeriod,
+                _ => return None,
+            };
+            Some(RawCtxChange {
+                field,
+                amount_text: t.amount_text,
+                enum_value: t.enum_value,
+                quantity_text: t.quantity_text,
+                duration_unit: t.duration_unit,
+                quote: t.quote,
+            })
+        })
+        .collect();
+    CtxExtraction { changes }
 }
 
 #[cfg(test)]

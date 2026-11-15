@@ -135,6 +135,7 @@ fn drain_evals(s: &mut Session, verdict: Option<NoulVerdict>) {
                 evaluate(s, trigger, verdict.clone().map(Ok));
             }
             Job::Turn { .. } => panic!("unexpected turn job"),
+            Job::Context { .. } => panic!("unexpected context job"),
         }
     }
 }

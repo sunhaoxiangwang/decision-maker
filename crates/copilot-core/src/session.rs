@@ -276,8 +276,16 @@ impl Decision {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Job {
-    Turn { seq: u64 },
-    Evaluate { trigger: Option<u64> },
+    Turn {
+        seq: u64,
+    },
+    Evaluate {
+        trigger: Option<u64>,
+    },
+    /// Voice-context extraction (negotiation only).
+    Context {
+        seq: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -413,6 +421,10 @@ pub struct Session {
     pub memory_seen: u64,
     /// A user-triggered evaluation failed; retryable without changing facts.
     pub eval_failed: Option<ApiError>,
+    /// Latest voice-context update (negotiation only) and bounded history.
+    pub context: Option<crate::context::ContextUpdate>,
+    pub context_history: VecDeque<crate::context::ContextUpdate>,
+    pub context_proposals: u64,
 }
 
 fn stale(msg: &str) -> ApiError {
@@ -457,6 +469,9 @@ impl Session {
             last_publish_ms: None,
             memory_seen: 0,
             eval_failed: None,
+            context: None,
+            context_history: VecDeque::new(),
+            context_proposals: 0,
         }
     }
 
@@ -505,7 +520,14 @@ impl Session {
                 true,
             ),
         };
-        let lt = self.latest_turn();
+        // provenance and timings belong to the current generation: a voice-context
+        // update (timings unmeasured -> null) or the turn with that server_seq
+        let gen_ctx = self.context_by_seq(self.generation);
+        let lt = if gen_ctx.is_some() {
+            None
+        } else {
+            self.turn(self.generation)
+        };
         let mut header = self.header(request_id, "cue_snapshot");
         header.error = d.and_then(|d| d.error.clone());
         let mut s = CueSnapshot {
@@ -533,10 +555,16 @@ impl Session {
             barriers: self.barriers.iter().copied().collect(),
             truncated: false,
             provenance: Provenance {
-                input_source: lt
-                    .map(|t| t.input_source.clone())
-                    .unwrap_or_else(|| "none".into()),
-                transcript_source: lt.map(|t| t.transcript_source.clone()),
+                input_source: match gen_ctx {
+                    Some(c) => c.input_source.clone(),
+                    None => lt
+                        .map(|t| t.input_source.clone())
+                        .unwrap_or_else(|| "none".into()),
+                },
+                transcript_source: match gen_ctx {
+                    Some(c) => Some(c.transcript_source.clone()),
+                    None => lt.map(|t| t.transcript_source.clone()),
+                },
                 providers: self.providers.clone(),
                 pipeline: "rust".into(),
                 decision_source: d
@@ -625,12 +653,12 @@ impl Session {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    fn bump_state(&mut self) {
+    pub(crate) fn bump_state(&mut self) {
         self.state_rev += 1;
     }
 
     /// Invalidate the standing decision immediately (LED clear) and queue re-evaluation.
-    fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         self.decision = None;
         self.phase = if self.closed {
             Phase::Closed
@@ -806,7 +834,7 @@ impl Session {
             .iter()
             .filter(|t| t.status.is_pre_apply_pending())
             .count();
-        if pending > TURN_QUEUE_MAX {
+        if pending > TURN_QUEUE_MAX || self.queue.len() >= SESSION_JOB_QUEUE_MAX {
             return Err(ApiError::new(
                 "turn_queue_full",
                 "too many turns waiting; retry shortly",
@@ -1563,6 +1591,10 @@ impl Session {
             }
             return Commit::Superseded;
         }
+        // re-checked under the commit lock: a pending context update makes this result stale
+        if self.context_open() {
+            return Commit::Stale;
+        }
         let mem_ok = memory.is_none_or(|m| {
             m.publication == ctx.memory_version
                 && m.publication >= self.memory_seen
@@ -1721,6 +1753,13 @@ impl Session {
             let mut d = self.barrier_decision();
             d.missing = unknowns;
             d.unconfirmed = unconfirmed;
+            return Rules::Final(d, vec![]);
+        }
+        // a pending voice-context update blocks positive cues (after PAUSE and barriers)
+        if let Some(mut d) = self.context_gate() {
+            d.missing.extend(unknowns);
+            d.unconfirmed = unconfirmed;
+            d.conditions = conditions;
             return Rules::Final(d, vec![]);
         }
         if !self.ambiguous.is_empty() {

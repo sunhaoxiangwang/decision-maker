@@ -226,6 +226,7 @@ pub async fn worker(app: Arc<App>, h: Arc<SessionHandle>) {
                 match job {
                     Job::Turn { seq } => s.fail_before_apply(seq, err, app.now_ms()),
                     Job::Evaluate { trigger } => s.fail_after_apply(trigger, err, app.now_ms()),
+                    Job::Context { seq } => s.fail_context(seq, err),
                 }
                 h.publish(&s);
                 continue;
@@ -255,6 +256,23 @@ pub async fn worker(app: Arc<App>, h: Arc<SessionHandle>) {
                     } else {
                         s.fail_before_apply(seq, err, app.now_ms());
                     }
+                    h.publish(&s);
+                }
+            }
+            Job::Context { seq } => {
+                let r =
+                    tokio::time::timeout_at(deadline, process_context(&app, &h, seq, deadline_ms))
+                        .await;
+                if r.is_err() {
+                    let mut s = h.state.lock().expect("session");
+                    s.fail_context(
+                        seq,
+                        ApiError::new(
+                            "job_deadline",
+                            format!("context update exceeded {JOB_DEADLINE_MS} ms"),
+                            true,
+                        ),
+                    );
                     h.publish(&s);
                 }
             }
@@ -460,5 +478,26 @@ fn fail_deadline(app: &App, h: &SessionHandle, trigger: Option<u64>) {
         ),
         app.now_ms(),
     );
+    h.publish(&s);
+}
+
+/// Voice-context extraction: snapshot under the lock, call the provider with no
+/// lock held, commit a proposal (never applied) under the lock.
+async fn process_context(app: &Arc<App>, h: &Arc<SessionHandle>, seq: u64, deadline_ms: u64) {
+    let job = {
+        let mut s = h.state.lock().expect("session");
+        let j = s.start_context(seq, app.now_ms(), deadline_ms);
+        h.publish(&s);
+        match j {
+            Some(j) => j,
+            None => return,
+        }
+    };
+    let res = app
+        .extractor
+        .extract_context(job.text.clone(), job.goals_summary.clone())
+        .await;
+    let mut s = h.state.lock().expect("session");
+    s.commit_context(&job, res, app.now_ms());
     h.publish(&s);
 }

@@ -12,6 +12,9 @@ pub const CLOSED_SESSIONS_KEPT: usize = 4;
 pub const TURN_RECORDS_PER_SESSION: usize = 64;
 pub const TRANSCRIPT_BYTES_PER_SESSION: usize = 1024 * 1024;
 pub const TURN_QUEUE_MAX: usize = 3;
+/// Total queued jobs per session (turns, evaluations and the single coalesced
+/// voice-context job). Obsolete context jobs are pruned, never counted twice.
+pub const SESSION_JOB_QUEUE_MAX: usize = 16;
 pub const OFFERS_PER_SESSION: usize = 20;
 pub const TOMBSTONES_PER_SESSION: usize = 100;
 pub const FACTS_PER_OFFER: usize = 32;

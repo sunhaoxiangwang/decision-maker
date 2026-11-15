@@ -6,6 +6,7 @@ use crate::memory::{Change, SaveResult};
 use axum::extract::{Form, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
+use copilot_core::context::{CtxAcceptReq, CtxStatus, TRIGGER_TYPED};
 use copilot_core::contract::{ApiError, Mode};
 use copilot_core::distance::{DistUnit, Distance};
 use copilot_core::lunch::{self, Allergen, AllergenStatus, Diet, LunchField, PrefKind, Strength};
@@ -223,6 +224,33 @@ fn turn_controls(s: &Session, app: &App) -> Markup {
     }
 }
 
+fn context_panel(s: &Session, app: &App) -> Markup {
+    html! {
+        p.muted { "Gesture-triggered goal updates. Nothing changes until you confirm the exact proposal below." }
+        @if let Some(c) = &s.context {
+            p { b { "Update " (c.update_id) } " (" (c.input_source) ", " (c.transcript_source) ", attempt " (c.attempt) "): “" (Session::excerpt_of(&c.text)) "” · " b { (format!("{:?}", c.status).to_uppercase()) }
+                @if let Some(e) = &c.error { " · " span.err { (e.code) ": " (e.message) } } }
+            @if !c.changes.is_empty() {
+                table { tr { th { "Goal" } th { "Current" } th { "Proposed" } th { "Evidence (excerpt)" } }
+                    @for ch in &c.changes { tr { td { (format!("{:?}", ch.value.field()).to_lowercase()) } td { (ch.old) } td { (ch.new) } td { "“" (ch.quote) "”" } } } }
+            }
+            @for r in &c.rejected { p.muted { "not proposed: " (r) } }
+            @if c.status == CtxStatus::Proposed {
+                form method="post" action="/ui/context/confirm" { (bind(app, s)) input type="hidden" name="update_id" value=(c.update_id); input type="hidden" name="proposal_version" value=(c.proposal_version);
+                    button { "Confirm these goal changes (v" (c.proposal_version) ")" } }
+            }
+            @if matches!(c.status, CtxStatus::Failed | CtxStatus::Stale | CtxStatus::Proposed) {
+                form method="post" action="/ui/context/retry" { (bind(app, s)) input type="hidden" name="update_id" value=(c.update_id); button { "Retry extraction" } }
+            }
+            @if c.status.is_open() {
+                form method="post" action="/ui/context/discard" { (bind(app, s)) input type="hidden" name="update_id" value=(c.update_id); button { "Discard (goals unchanged)" } }
+            }
+        }
+        form method="post" action="/ui/context" { (bind(app, s)) input type="hidden" name="nonce" value=(uuid::Uuid::new_v4().simple());
+            "Typed voice update (stand-in for the gesture + transcript; labelled typed or simulated): " input name="text" size="50" placeholder="My budget is now $1,300 including delivery."; " " button { "Submit as context update" } }
+    }
+}
+
 fn goals_form(s: &Session, app: &App) -> Markup {
     let g = &s.goals;
     html! {
@@ -307,6 +335,7 @@ pub async fn index(State(app): State<Arc<App>>) -> Html<String> {
             div.row {
                 div.card { h2 { "Goals" }
                     @if h.mode == Mode::Negotiation { (goals_form(&s, &app)) } @else { (lunch_setup(&s, &app)) } }
+            @if h.mode == Mode::Negotiation && s.goals_confirmed { div.card { h2 { "Voice context update" } (context_panel(&s, &app)) } }
                 div.card { h2 { "Typed turn (simulated input)" }
                     form method="post" action="/ui/turn" { (bind(&app, &s)) input type="hidden" name="nonce" value=(uuid::Uuid::new_v4().simple().to_string());
                         textarea name="text" placeholder="e.g. Best I can do is $1,150 delivered, queen, firm, with a 100-night return." {}
@@ -994,4 +1023,59 @@ pub async fn post_memory_new_profile(
         .new_profile(f.get("fingerprint").cloned().unwrap_or_default())
         .await;
     save_result(&app, r)
+}
+
+// ---------------------------------------------------------------------------
+// Voice-context updates (negotiation only)
+// ---------------------------------------------------------------------------
+
+/// Typed SIMULATED context update: same admission path as the bridge.
+pub async fn post_context(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
+    let sh = session!(app, h, f);
+    let nonce = f.get("nonce").cloned().unwrap_or_default();
+    let req = CtxAcceptReq {
+        mode: sh.mode,
+        source_id: "ui".into(),
+        update_id: format!("ui-ctx-{}", copilot_core::text::bounded(&nonce, 64).0),
+        source_seq: None,
+        trigger: TRIGGER_TYPED.into(),
+        text: f.get("text").cloned().unwrap_or_default(),
+        transcript_source: "typed".into(),
+        input_source: if h.contains_key("x-copilot-simulated") {
+            "simulated".into()
+        } else {
+            "typed".into()
+        },
+        now_ms: app.now_ms(),
+    };
+    mutate(&app, &sh, |s| s.accept_context(req).map(|_| ()))
+}
+
+pub async fn post_context_confirm(
+    State(app): State<Arc<App>>,
+    h: HeaderMap,
+    Form(f): F,
+) -> Response {
+    let sh = session!(app, h, f);
+    let uid = f.get("update_id").cloned().unwrap_or_default();
+    mutate(&app, &sh, |s| {
+        s.confirm_context(rev(&f), &uid, num(&f, "proposal_version").unwrap_or(0))
+    })
+}
+
+pub async fn post_context_discard(
+    State(app): State<Arc<App>>,
+    h: HeaderMap,
+    Form(f): F,
+) -> Response {
+    let sh = session!(app, h, f);
+    let uid = f.get("update_id").cloned().unwrap_or_default();
+    mutate(&app, &sh, |s| s.discard_context(rev(&f), &uid))
+}
+
+pub async fn post_context_retry(State(app): State<Arc<App>>, h: HeaderMap, Form(f): F) -> Response {
+    let sh = session!(app, h, f);
+    let uid = f.get("update_id").cloned().unwrap_or_default();
+    let now = app.now_ms();
+    mutate(&app, &sh, |s| s.retry_context(rev(&f), &uid, now))
 }
