@@ -94,6 +94,14 @@ impl Copilot {
     /// result is never actionable: the proposal is confirmed (or discarded) in the copilot UI.
     /// `source_seq` shares the turn counter, so turns and updates stay strictly ordered.
     pub fn context_update(&self, turn_id: u64, text: &str) -> Result<Value, String> {
+        // With COPILOT_VOICE_GOALS=auto on the server, the first wave starts the session and
+        // sets the goals; otherwise the server refuses and the UI-only message stands.
+        if let Err(e) = self.discover() {
+            if !e.contains("no active session") {
+                return Err(e);
+            }
+            self.request("POST", "/v1/sessions", Some(&json!({"protocol": "vexo-copilot/1"}))).map_err(|_| e)?;
+        }
         self.post("context update", |a, seq| {
             let sid = &a.session_id;
             (format!("/v1/sessions/{sid}/context-updates"), json!({

@@ -113,7 +113,13 @@ async fn setup(ctx: &mut Ctx, sc: &Value) {
     ctx.form("/ui/session", &[("mode", mode.into())], Some(""))
         .await;
     let info = ctx.api_get("/v1/sessions/active").await;
-    ctx.session = info["session_id"].as_str().expect("session").to_string();
+    ctx.session = match info["session_id"].as_str() {
+        Some(s) => s.to_string(),
+        None => panic!(
+            "no active session: {} (is COPILOT_BRIDGE_TOKEN the same as the server's?)",
+            info["error"]["message"].as_str().unwrap_or("unknown error")
+        ),
+    };
     ctx.instance = info["instance_id"].as_str().expect("instance").to_string();
     ctx.mode = if mode == "lunch" {
         Mode::Lunch

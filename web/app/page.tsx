@@ -5,7 +5,7 @@ import Conversation from '@/components/Conversation';
 import DecisionCard from '@/components/DecisionCard';
 import { decisionRequest } from '@/lib/memory';
 import { useNames } from '@/lib/names';
-import { selectedTurn, visibleTurns, type Mode, type Session } from '@/lib/store';
+import { selectedTurn, visibleTurns } from '@/lib/store';
 import { useBridge } from '@/lib/useBridge';
 
 const MIC = { live: '● Mic live', 'cue-hold': 'Mic paused for cue', off: 'Mic off' } as const;
@@ -14,10 +14,6 @@ export default function Live() {
   const { state, dispatch, link } = useBridge();
   const { session, status } = state;
   const { name } = useNames();
-
-  const save = (next: Session, _post: boolean) => {
-    dispatch({ type: 'session', session: next }); // local goals until the decision component is connected
-  };
 
   const sel = selectedTurn(state);
   const turn = sel == null ? undefined : state.turns[sel];
@@ -36,11 +32,7 @@ export default function Live() {
     <div className="split">
       <section className="chat">
         <header className="topbar">
-          <select aria-label="Mode" value={session.mode} onChange={(e) => save({ ...session, mode: e.target.value as Mode }, true)}>
-            <option value="negotiation">Negotiation</option>
-            <option value="lunch">Lunch</option>
-          </select>
-          <a className="chip link" href="http://127.0.0.1:8787/" target="_blank" rel="noreferrer" title="Start a session, confirm goals and memory">Open copilot</a>
+          <h1 className="title">Live</h1>
           <span className={`chip${status?.mic === 'live' ? ' rec' : ''}`}>{status ? MIC[status.mic] : 'Mic unknown'}</span>
           {state.decisionsOn !== null && (
             <span className={`chip${state.decisionsOn ? ' on' : ''}`} title="Triple-tap the band to switch">
@@ -48,21 +40,14 @@ export default function Live() {
             </span>
           )}
           {state.context && <span className="chip rec">Recording memory</span>}
-          {state.gesture && (
-            <span key={state.gesture.time_ms} className="chip flash" role="status" aria-live="polite">
-              {state.gesture.name === 'wave' ? 'Wave' : 'Triple tap'}: {state.gesture.name === 'wave' ? 'memory' : 'decisions'} {state.gesture.on ? 'on' : 'off'}, {new Date(state.gesture.time_ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-            </span>
-          )}
           {!empty && state.decisionsOn !== false && (
             <button className="ghost" title="Keep this conversation in Memory › Past conversations and start a new one"
               onClick={() => dispatch({ type: 'new-conversation' })}>New conversation</button>
           )}
         </header>
-        {(status?.mic === 'live' || micUnknown) && (
+        {micUnknown && (
           <div className="banner" role="status">
-            {micUnknown
-              ? 'Bridge connected, mic state not reported: assume this conversation is being recorded and sent to Deepgram.'
-              : 'Recording: audio goes to Deepgram.'}
+            Bridge connected, mic state not reported: assume this conversation is being recorded and sent to Deepgram.
           </div>
         )}
         <div className="thread">

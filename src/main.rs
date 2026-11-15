@@ -72,7 +72,10 @@ fn main() {
                         }
                     }
                 }
-                Err(e) => eprintln!("  {e}"), // stays awaiting: fail closed until a newer turn is accepted
+                Err(e) => { // stays awaiting: fail closed until a newer turn is accepted
+                    eprintln!("  {e}");
+                    notice(&bridge, &format!("Copilot did not decide this turn ({e}).{}", hint(&e)));
+                }
             }
         } else if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Context) {
             // goal update spoken between three-wave gestures: proposal only, never an LED cue
@@ -80,9 +83,13 @@ fn main() {
                 match c.context_update(t.turn_id, &t.text) {
                     Ok(r) => {
                         cue_poll::on_context_result(&mut model.lock().unwrap(), &r);
-                        println!("  context update {} -> {} (confirm in the copilot UI)", r["update"]["update_id"], r["status"])
+                        println!("  context update {} -> {}", r["update"]["update_id"], r["status"]);
+                        notice(&bridge, &goals_notice(&r));
                     }
-                    Err(e) => eprintln!("  {e}"),
+                    Err(e) => {
+                        eprintln!("  {e}");
+                        notice(&bridge, &format!("Goal update not sent ({e}).{}", hint(&e)));
+                    }
                 }
             } else {
                 println!("  TYPED context not sent to the copilot: /wave only simulates the band's three-wave gesture");
@@ -96,6 +103,38 @@ fn main() {
 }
 
 /// Context updates go to the copilot with trigger `three_waves` (src/copilot.rs). That is only
+/// A sidebar notice on the page (the UI's `gap` event), so copilot problems are visible there.
+fn notice(bridge: &Bridge, message: &str) {
+    let _ = bridge.publish(&serde_json::json!({"type": "gap", "message": message}).to_string());
+}
+
+fn hint(e: &str) -> &'static str {
+    if e.contains("no active session") || e.contains("no_active_session") {
+        " Start a session at http://127.0.0.1:8787/, or run the server with COPILOT_VOICE_GOALS=auto."
+    } else if e.contains("goals_unconfirmed") {
+        " Wave three times and say your size, firmness, budget and return period."
+    } else {
+        ""
+    }
+}
+
+/// What a wave did to the goals: applied changes (auto mode), a proposal to confirm, or why not.
+fn goals_notice(r: &serde_json::Value) -> String {
+    let p = &r["proposal"];
+    let changes: Vec<String> = p["changes"].as_array().into_iter().flatten()
+        .map(|c| c["new"].as_str().unwrap_or("?").to_string()) // e.g. "budget $1,300.00 incl. delivery"
+        .collect();
+    let notes: Vec<&str> = p["rejected"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+    let status = r["status"].as_str().unwrap_or("?");
+    let head = match status {
+        "APPLIED" => format!("Goals updated: {}.", changes.join(", ")),
+        "PROPOSED" => format!("Goal change proposed: {}. Confirm it in the copilot UI.", changes.join(", ")),
+        "PENDING" => "Reading the goal update…".to_string(),
+        other => format!("Goal update {}: {}.", other.to_lowercase(), r["error"]["message"].as_str().unwrap_or("no change")),
+    };
+    if notes.is_empty() { head } else { format!("{head} {}", notes.join("; ")) }
+}
+
 /// true with the band, where the wrapper opens a context window solely on three recognised
 /// waves (pipeline/band_pipeline.py THREE_WAVES); typed `/wave` is a simulation, so typed
 /// context stays local (UI memory only) and is never submitted as a gesture.
