@@ -210,6 +210,23 @@ pub fn decision_event(turn_id: u64, snapshot: &Value, time_ms: u128) -> Option<S
     }).to_string())
 }
 
+// Cue polling (src/cue_poll.rs): session discovery and one waiting cue poll at a time.
+impl Copilot {
+    /// `session_info` for the active session (instance_id, session_id, mode, rev, ...).
+    pub fn active_session(&self) -> Result<Value, String> {
+        self.request("GET", "/v1/sessions/active", None)
+    }
+
+    /// The session's `cue_snapshot`, waiting up to `wait_ms` (server caps it at 20000) for
+    /// `rev > after_rev`. Keep `wait_ms` under the 20 s read timeout of `request`.
+    pub fn cue(&self, sid: &str, after_rev: u64, wait_ms: u64) -> Result<Value, String> {
+        if sid.is_empty() || !sid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err("copilot: unexpected session id".into());
+        }
+        self.request("GET", &format!("/v1/sessions/{sid}/cue?after_rev={after_rev}&wait_ms={wait_ms}"), None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

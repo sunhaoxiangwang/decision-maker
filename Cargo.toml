@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 pyo3 = { version = "0.22", features = ["auto-initialize"] }
 serde_json = { workspace = true }
+copilot-core = { path = "crates/copilot-core" }
 
 # The copilot app (leo/copilot-app) shares this workspace with the bridge package above.
 [workspace]
