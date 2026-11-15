@@ -1753,3 +1753,397 @@ async fn post_rename_reset_failure_is_uncertain_and_consistent_with_disk() {
     assert!(app2.memory.view().recovery_required.is_none());
     assert!(app2.memory.view().prefs.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Voice-context updates (negotiation only; MOCK providers, SIMULATED input)
+// ---------------------------------------------------------------------------
+
+fn ctx_body(sid: &str, mode: &str, uid: &str, seq: u64, text: &str, trigger: &str) -> Value {
+    json!({"protocol":"vexo-copilot/1","session_id":sid,"mode":mode,"source_id":"cy-bridge",
+        "update_id":uid,"source_seq":seq,"trigger":trigger,
+        "transcript":{"text":text,"transcript_source":"simulated"}})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn context_update_bridge_flow_proposes_then_confirm_applies_once() {
+    let t = start("mock").await;
+    let sid = t.negotiation_session().await;
+    let (st, _) = t
+        .turn(
+            &sid,
+            "c1",
+            1,
+            "Best I can do is $1,250 delivered, queen, firm, with a 100-night return.",
+        )
+        .await;
+    assert_eq!(st, 200);
+    wait_outcome(&t, "PAUSE").await;
+    let p = format!("/v1/sessions/{sid}/context-updates");
+    let text = "My budget is now $1,300 including delivery.";
+    let (st, v) = t
+        .api(
+            "POST",
+            &p,
+            Some(ctx_body(&sid, "negotiation", "u1", 2, text, "three_waves")),
+        )
+        .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["kind"], "context_update_result");
+    assert_eq!(v["status"], "PROPOSED");
+    assert_eq!(v["actionable"], false);
+    assert!(v["cue"].is_null());
+    assert_eq!(v["generation"], v["update"]["server_seq"]);
+    assert_eq!(v["proposal"]["changes"][0]["field"], "budget");
+    let pv = v["proposal"]["version"].as_u64().unwrap();
+    let gen = v["update"]["server_seq"].as_u64().unwrap();
+    // goals unchanged until confirmation; PAUSE still outranks the pending update
+    assert_eq!(
+        t.app
+            .active()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .goals
+            .budget_cents,
+        120_000
+    );
+    let cue = wait_outcome(&t, "PAUSE").await;
+    assert_eq!(cue["generation"].as_u64().unwrap(), gen);
+    // duplicates, reuse, ordering, trigger
+    let (st, d) = t
+        .api(
+            "POST",
+            &p,
+            Some(ctx_body(&sid, "negotiation", "u1", 2, text, "three_waves")),
+        )
+        .await;
+    assert_eq!(
+        (st, d["duplicate"].clone(), d["status"].clone()),
+        (200, json!(true), json!("PROPOSED"))
+    );
+    let (st, d) = t
+        .api(
+            "POST",
+            &p,
+            Some(ctx_body(
+                &sid,
+                "negotiation",
+                "u1",
+                2,
+                "My budget is now $1,500.",
+                "three_waves",
+            )),
+        )
+        .await;
+    assert_eq!(
+        (st, d["error"]["code"].clone()),
+        (409, json!("update_id_reused"))
+    );
+    let (st, d) = t
+        .api(
+            "POST",
+            &p,
+            Some(ctx_body(&sid, "negotiation", "u2", 2, text, "three_waves")),
+        )
+        .await;
+    assert_eq!(
+        (st, d["error"]["code"].clone()),
+        (409, json!("stale_update"))
+    );
+    let (st, d) = t
+        .api(
+            "POST",
+            &p,
+            Some(ctx_body(&sid, "negotiation", "u3", 9, text, "tap")),
+        )
+        .await;
+    assert_eq!(
+        (st, d["error"]["code"].clone()),
+        (422, json!("unsupported_trigger"))
+    );
+    let (st, d) = t.api("GET", &format!("{p}/u1"), None).await;
+    assert_eq!((st, d["status"].clone()), (200, json!("PROPOSED")));
+    let (st, _) = t.api("GET", &format!("{p}/nope"), None).await;
+    assert_eq!(st, 404);
+    // confirm the exact proposal through the session-bound UI form
+    let pvs = pv.to_string();
+    assert_eq!(
+        t.form(
+            "/ui/context/confirm",
+            &[("update_id", "u1"), ("proposal_version", &pvs)]
+        )
+        .await,
+        303
+    );
+    {
+        let h = t.app.active().unwrap();
+        let s = h.state.lock().unwrap();
+        assert_eq!(s.goals.budget_cents, 130_000);
+        assert_eq!(s.goals.min_return_nights, 100);
+    }
+    let (_, d) = t.api("GET", &format!("{p}/u1"), None).await;
+    assert_eq!(d["status"], "APPLIED");
+    // re-evaluated against the new goals: no longer over budget
+    let cue = wait_outcome(&t, "ASK").await;
+    assert_eq!(cue["generation"].as_u64().unwrap(), gen);
+    // a second confirmation is rejected and changes nothing
+    let gv = t.app.active().unwrap().state.lock().unwrap().goals_version;
+    assert_ne!(
+        t.form(
+            "/ui/context/confirm",
+            &[("update_id", "u1"), ("proposal_version", &pvs)]
+        )
+        .await,
+        303
+    );
+    assert_eq!(
+        t.app.active().unwrap().state.lock().unwrap().goals_version,
+        gv
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn context_update_is_rejected_for_lunch_before_extraction() {
+    let t = start("mock").await;
+    lunch_session(&t).await;
+    let sid = t.app.active().unwrap().id.clone();
+    let (st, v) = t
+        .api(
+            "POST",
+            &format!("/v1/sessions/{sid}/context-updates"),
+            Some(ctx_body(
+                &sid,
+                "lunch",
+                "u1",
+                1,
+                "Make it within half a mile.",
+                "three_waves",
+            )),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"]["code"].clone()),
+        (422, json!("context_update_unsupported"))
+    );
+    let h = t.app.active().unwrap();
+    let s = h.state.lock().unwrap();
+    assert!(s.context.is_none());
+    assert!(!s
+        .queue
+        .iter()
+        .any(|j| matches!(j, copilot_core::session::Job::Context { .. })));
+}
+
+async fn post_form_with(t: &T, p: &str, fields: &[(&str, &str)], simulated: bool) -> u16 {
+    let h = t.app.active().unwrap();
+    let (sid, rev) = (h.id.clone(), h.state.lock().unwrap().state_rev);
+    let mut form: Vec<(&str, String)> = vec![
+        ("csrf", t.app.csrf.clone()),
+        ("session_id", sid),
+        ("state_rev", rev.to_string()),
+    ];
+    form.extend(fields.iter().map(|(k, v)| (*k, v.to_string())));
+    let enc = |s: &str| {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect::<String>()
+    };
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{k}={}", enc(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut rb = t
+        .http
+        .post(t.url(p))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body);
+    if simulated {
+        rb = rb.header("x-copilot-simulated", "1");
+    }
+    rb.send().await.unwrap().status().as_u16()
+}
+
+async fn wait_ctx_status(t: &T, want: &str) {
+    for _ in 0..200 {
+        let st = {
+            let h = t.app.active().unwrap();
+            let s = h.state.lock().unwrap();
+            s.context
+                .as_ref()
+                .map(|c| format!("{:?}", c.status).to_uppercase())
+        };
+        if st.as_deref() == Some(want) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("context never reached {want}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rapid_context_updates_while_extraction_is_held_stay_bounded() {
+    use copilot_core::context::CtxExtraction;
+    use copilot_providers::mock::{Scripted, ScriptedExtractor};
+    let ex = Arc::new(ScriptedExtractor::new(vec![]));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    ex.context_queue.lock().unwrap().push_back(Scripted::Gate(
+        rx,
+        Box::new(Scripted::Ok(CtxExtraction { changes: vec![] })),
+    ));
+    let t = start_with(
+        ex.clone(),
+        Arc::new(MockDecider),
+        "mock",
+        None,
+        None,
+        tempdir("ctxq"),
+    )
+    .await;
+    t.negotiation_session().await;
+    let text = "My budget is now $1,300 including delivery.";
+    assert_eq!(
+        post_form_with(&t, "/ui/context", &[("text", text), ("nonce", "n0")], false).await,
+        303
+    );
+    for _ in 0..200 {
+        if ex.calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        ex.calls.load(Ordering::SeqCst),
+        1,
+        "first extraction is held"
+    );
+    for i in 1..=40 {
+        let n = format!("n{i}");
+        assert_eq!(
+            post_form_with(&t, "/ui/context", &[("text", text), ("nonce", &n)], false).await,
+            303
+        );
+        let h = t.app.active().unwrap();
+        let s = h.state.lock().unwrap();
+        let ctx_jobs = s
+            .queue
+            .iter()
+            .filter(|j| matches!(j, copilot_core::session::Job::Context { .. }))
+            .count();
+        assert!(ctx_jobs <= 1);
+        assert!(s.queue.len() <= copilot_core::limits::SESSION_JOB_QUEUE_MAX);
+        assert!(s.context_history.len() <= copilot_core::context::CONTEXT_HISTORY);
+    }
+    tx.send(()).unwrap();
+    wait_ctx_status(&t, "PROPOSED").await;
+    let h = t.app.active().unwrap();
+    let s = h.state.lock().unwrap();
+    assert_eq!(
+        s.context.as_ref().unwrap().update_id,
+        "ui-ctx-n40",
+        "newest update processed"
+    );
+    assert_eq!(
+        ex.calls.load(Ordering::SeqCst),
+        2,
+        "obsolete updates were never extracted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_and_simulated_context_after_bridge_turn_keep_their_provenance() {
+    let t = start("mock").await;
+    let sid = t.negotiation_session().await;
+    let (st, _) = t
+        .api(
+            "POST",
+            &format!("/v1/sessions/{sid}/turns"),
+            Some(json!({"protocol":"vexo-copilot/1","session_id":sid,"mode":"negotiation","source_id":"cy-bridge",
+                "client_turn_id":"b1","source_seq":1,"transcript":{"text":"Best I can do is $1,250 delivered, queen, firm, with a 100-night return.","transcript_source":"deepgram"}})),
+        )
+        .await;
+    assert_eq!(st, 200);
+    let cue = wait_outcome(&t, "PAUSE").await;
+    assert_eq!(cue["provenance"]["input_source"], "bridge");
+    let text = "My budget is now $1,300 including delivery.";
+    for (simulated, label, nonce) in [(false, "typed", "a"), (true, "simulated", "b")] {
+        assert_eq!(
+            post_form_with(
+                &t,
+                "/ui/context",
+                &[("text", text), ("nonce", nonce)],
+                simulated
+            )
+            .await,
+            303
+        );
+        wait_ctx_status(&t, "PROPOSED").await;
+        let (_, cue) = t.api("GET", &format!("/v1/sessions/{sid}/cue"), None).await;
+        assert_eq!(cue["provenance"]["input_source"], label);
+        assert_eq!(cue["provenance"]["transcript_source"], "typed");
+        assert!(cue["timings_ms"]["accept_to_publish"].is_null());
+        assert!(cue["timings_ms"]["extract"].is_null());
+    }
+    // confirm the simulated proposal, then a fresh evaluation keeps that generation's labels
+    let (gen, pv) = {
+        let h = t.app.active().unwrap();
+        let s = h.state.lock().unwrap();
+        let c = s.context.as_ref().unwrap();
+        (c.server_seq, c.proposal_version.to_string())
+    };
+    assert_eq!(
+        post_form_with(
+            &t,
+            "/ui/context/confirm",
+            &[("update_id", "ui-ctx-b"), ("proposal_version", &pv)],
+            false
+        )
+        .await,
+        303
+    );
+    let cue = wait_outcome(&t, "ASK").await;
+    assert_eq!(cue["generation"].as_u64().unwrap(), gen);
+    assert_eq!(cue["provenance"]["input_source"], "simulated");
+    assert!(cue["timings_ms"]["e2e"].is_null());
+    // bridge route honours the additive header too
+    let st = t
+        .http
+        .post(t.url(&format!("/v1/sessions/{sid}/context-updates")))
+        .bearer_auth("tok")
+        .header("x-copilot-simulated", "1")
+        .header("content-type", "application/json")
+        .body(
+            serde_json::to_vec(&ctx_body(
+                &sid,
+                "negotiation",
+                "bu1",
+                2,
+                "My budget is now $1,350.",
+                "three_waves",
+            ))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(st, 200);
+    let h = t.app.active().unwrap();
+    assert_eq!(
+        h.state
+            .lock()
+            .unwrap()
+            .context
+            .as_ref()
+            .unwrap()
+            .input_source,
+        "simulated"
+    );
+}

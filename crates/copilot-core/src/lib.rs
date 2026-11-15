@@ -2,6 +2,7 @@
 //! No network or disk I/O lives here.
 
 pub mod bridge_model;
+pub mod context;
 pub mod contextual;
 pub mod contract;
 pub mod distance;

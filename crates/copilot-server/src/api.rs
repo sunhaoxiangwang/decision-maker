@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use copilot_core::context::{ContextUpdateRequest, CtxAcceptReq, CtxStatus, TRIGGER_THREE_WAVES};
 use copilot_core::contract::*;
 use copilot_core::limits::*;
 use copilot_core::session::{AcceptReq, Accepted, Session};
@@ -742,4 +743,204 @@ pub async fn get_occupancy(State(app): State<Arc<App>>) -> Response {
         "sessions": sessions,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Voice-context updates (negotiation only; never actionable)
+// ---------------------------------------------------------------------------
+
+fn ctx_status_for(code: &str) -> StatusCode {
+    match code {
+        "context_update_unsupported" | "unsupported_trigger" | "field_too_long" => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        c => status_for(c),
+    }
+}
+
+async fn wait_context(h: &SessionHandle, update_id: &str, max_ms: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(max_ms);
+    loop {
+        let notified = h.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let s = h.state.lock().expect("session");
+            let pending = s
+                .context
+                .as_ref()
+                .is_some_and(|c| c.update_id == update_id && c.status == CtxStatus::Pending);
+            if !pending {
+                return;
+            }
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return;
+        }
+    }
+}
+
+pub async fn post_context_update(
+    State(app): State<Arc<App>>,
+    Path(sid): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let loose: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let echo = loose
+        .as_ref()
+        .and_then(|v| v.get("update_id").cloned())
+        .map(|c| serde_json::json!({"update_id": c}));
+    let bad = |code: &str, st: StatusCode, msg: &str, sid: &str| {
+        err_env(
+            &app,
+            st,
+            code,
+            msg,
+            false,
+            Some(sid.into()),
+            None,
+            echo.clone(),
+        )
+    };
+    let req: ContextUpdateRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return bad(
+                "bad_request",
+                StatusCode::BAD_REQUEST,
+                &format!("invalid context update request: {e}"),
+                &sid,
+            )
+        }
+    };
+    if req.protocol != PROTOCOL {
+        return bad(
+            "unsupported_protocol",
+            StatusCode::BAD_REQUEST,
+            "protocol must be vexo-copilot/1",
+            &sid,
+        );
+    }
+    if req.source_id != "cy-bridge" {
+        return bad(
+            "source_mismatch",
+            StatusCode::FORBIDDEN,
+            "bridge token belongs to source cy-bridge",
+            &sid,
+        );
+    }
+    if req.trigger != TRIGGER_THREE_WAVES {
+        return bad(
+            "unsupported_trigger",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "trigger must be three_waves",
+            &sid,
+        );
+    }
+    let Some(h) = app.find(&sid) else {
+        return bad(
+            "session_not_found",
+            StatusCode::NOT_FOUND,
+            "unknown session",
+            &sid,
+        );
+    };
+    if req.session_id != sid {
+        return bad(
+            "session_mismatch",
+            StatusCode::CONFLICT,
+            "session_id differs from the path",
+            &sid,
+        );
+    }
+    let accepted = {
+        let mut s = h.state.lock().expect("session");
+        let r = s.accept_context(CtxAcceptReq {
+            mode: req.mode,
+            source_id: req.source_id.clone(),
+            update_id: req.update_id.clone(),
+            source_seq: Some(req.source_seq),
+            trigger: req.trigger.clone(),
+            text: req.transcript.text.clone(),
+            transcript_source: req.transcript.transcript_source.clone(),
+            input_source: if req.transcript.transcript_source == "simulated"
+                || headers.contains_key("x-copilot-simulated")
+            {
+                "simulated".into()
+            } else {
+                "bridge".into()
+            },
+            now_ms: app.now_ms(),
+        });
+        h.publish(&s);
+        r
+    };
+    let dup = match accepted {
+        Ok(Accepted::New(_)) => false,
+        Ok(Accepted::Duplicate(_)) => true,
+        Err(e) => {
+            return err_env(
+                &app,
+                ctx_status_for(&e.code),
+                &e.code,
+                &e.message,
+                e.retryable,
+                Some(sid),
+                Some(h.mode),
+                echo,
+            )
+        }
+    };
+    wait_context(&h, &req.update_id, TURN_RESPONSE_WAIT_MS).await;
+    let s = h.state.lock().expect("session");
+    match s.context_result(&req.source_id, &req.update_id, &app.request_id()) {
+        Some(r) => {
+            let mut v = serde_json::to_value(&r).unwrap_or_default();
+            v["duplicate"] = serde_json::json!(dup);
+            Json(v).into_response()
+        }
+        None => err_env(
+            &app,
+            StatusCode::CONFLICT,
+            "stale_update",
+            "context update no longer retained",
+            false,
+            Some(sid),
+            Some(h.mode),
+            echo,
+        ),
+    }
+}
+
+pub async fn get_context_update(
+    State(app): State<Arc<App>>,
+    Path((sid, uid)): Path<(String, String)>,
+) -> Response {
+    let Some(h) = app.find(&sid) else {
+        return err_env(
+            &app,
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "unknown session",
+            false,
+            Some(sid),
+            None,
+            None,
+        );
+    };
+    let s = h.state.lock().expect("session");
+    match s.context_result("cy-bridge", &uid, &app.request_id()) {
+        Some(r) => Json(r).into_response(),
+        None => err_env(
+            &app,
+            StatusCode::NOT_FOUND,
+            "not_accepted",
+            "no context update with that update_id",
+            false,
+            Some(sid),
+            Some(h.mode),
+            None,
+        ),
+    }
 }

@@ -22,6 +22,14 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/sessions/{sid}/turns", post(api::post_turn))
         .route("/v1/sessions/{sid}/turns/{cid}", get(api::get_turn))
         .route(
+            "/v1/sessions/{sid}/context-updates",
+            post(api::post_context_update),
+        )
+        .route(
+            "/v1/sessions/{sid}/context-updates/{uid}",
+            get(api::get_context_update),
+        )
+        .route(
             "/v1/sessions/{sid}/turns/{cid}/cancel",
             post(api::post_cancel),
         )
@@ -57,6 +65,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/ui/correct", post(ui::post_correct))
         .route("/ui/unresolved/dismiss", post(ui::post_unresolved_dismiss))
         .route("/ui/eval/retry", post(ui::post_eval_retry))
+        .route("/ui/context", post(ui::post_context))
+        .route("/ui/context/confirm", post(ui::post_context_confirm))
+        .route("/ui/context/discard", post(ui::post_context_discard))
+        .route("/ui/context/retry", post(ui::post_context_retry))
         .route(
             "/ui/lunch/unresolved/dismiss",
             post(ui::post_lunch_unresolved),

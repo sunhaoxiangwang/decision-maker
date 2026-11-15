@@ -14,6 +14,7 @@ This repository holds the companion UI, backend, Rust orchestration, Gemini adap
 | Real band / hardware | **Not tested.** Cue colours are proposals until Cy verifies them on the band |
 | Contract with Cy | **Proposed, not yet agreed** |
 | Mastra, OpenAI memory summaries, Places | Not part of this implementation |
+| Voice context update (negotiation only, branch `leo/voice-context-update`) | Implemented; covered by tests; one live run with real Gemini and **simulated** bridge input. Not tested with Cy's bridge, gestures or the band |
 
 ## Layout
 
@@ -56,6 +57,8 @@ Without `GEMINI_API_KEY` and without `--mock`, the app runs with providers **unc
    - `Best I can do is $1,150 delivered, queen, firm, with a 100-night return.` → **ASK**, waiting for confirmation.
 3. Open **/confirm** (link in the status panel), check the quoted evidence, **Confirm all shown** → **PROCEED** (green) after the contextual check.
 4. Evidence is checked in its original clause: "it is not firm" can never become "firm". A rejected critical reading stays open as an *unresolved interpretation* and blocks PROCEED until you **correct the value** or **dismiss** it. Unclear turns can be ignored or explicitly treated as a new offer or an amendment. A failed confirmation-triggered evaluation shows **Retry evaluation**.
+
+5. **Voice context update** (SIMULATED typed form, or the bridge after the three-wave gesture): `My budget is now $1,300 including delivery.` → a proposal shows current vs. proposed goals with the quoted evidence; cues stay at most ASK (PAUSE if already violated) until you **Confirm** (goals change, offer re-evaluated), **Retry** or **Discard** (goals unchanged). Relative changes are not proposed. Lunch does not support voice updates.
 
 ## Demo: lunch (UI)
 

@@ -22,6 +22,8 @@ Leo's app (this repository) decides and publishes cues. Cy's bridge captures aud
 | `GET /v1/sessions/{sid}/cue?after_rev=N&wait_ms=W` | `cue_snapshot`, waiting up to `min(W, 20000)` ms for `rev > N`; at most 8 waiting polls |
 | `POST /v1/sessions/{sid}/cue-reports` | Optional latency report (≤ 1 KiB, strictly validated: protocol, a published `rev`, `applied` = `led_set`/`led_off`, known duration keys ≤ 600000 ms); recorded as *bridge-reported*, not hardware validation |
 | `GET /v1/diagnostics/occupancy` | Retention and admission counters (used by the stress check) |
+| `POST /v1/sessions/{sid}/context-updates` | Voice context update after the three-wave gesture (negotiation only); returns `context_update_result` within 15 s (`PENDING` if still running) |
+| `GET /v1/sessions/{sid}/context-updates/{update_id}` | Look up a context update (`context_update_result`, or 404 `not_accepted`) |
 
 ## Turn request
 
@@ -33,6 +35,23 @@ Leo's app (this repository) decides and publishes cues. Cy's bridge captures aud
 
 - `source_seq` strictly increases per bridge. `client_turn_id` is unique per submission; resending the identical body is idempotent.
 - `speaker` is informational only. Transcript text never confirms anything.
+
+## Voice context update (negotiation only; proposed, not yet agreed)
+
+```json
+{"protocol":"vexo-copilot/1","session_id":"<sid>","mode":"negotiation","source_id":"cy-bridge",
+ "update_id":"<bridge_boot>-ctx-<n>","source_seq":8,"trigger":"three_waves",
+ "transcript":{"text":"My budget is now $1,300 including delivery.","transcript_source":"deepgram"}}
+```
+
+- `source_seq` is shared with turns (one strictly increasing counter per bridge); an update takes the next session `generation` like a turn, so the bridge sets `min_generation = max(min_generation, update.server_seq)`.
+- The result is **never actionable** (`cue:null`). Statuses: `PENDING`, `PROPOSED` (with `proposal{version, base_goals_version, base_state_rev, changes[{field, old, new, quote}], rejected[]}`), `FAILED`, `STALE`, `SUPERSEDED`, `APPLIED`, `DISCARDED`.
+- Two different revisions: `proposal.base_goals_version` is the goals version the proposal was computed against (confirmation fails, and the update becomes `STALE`, if goals changed since). `proposal.base_state_rev` is the session `state_rev` when extraction started (if it changes before the proposal is saved, the update is `STALE`). Confirmation in the companion UI is additionally bound to the session's **current** `state_rev` (the header `state_rev` when the form was loaded) and to `proposal.version`.
+- `session_info.source_latest` stays turn-only; after a timeout the bridge resyncs an update with `GET /v1/sessions/{sid}/context-updates/{update_id}`.
+- Cues for an update's generation carry that update's `input_source`/`transcript_source`; timings not measured for it are `null`. `X-Copilot-Simulated: 1` (or `transcript_source:"simulated"`) labels the update `simulated`.
+- Only the newest update can run: queued jobs for older updates are dropped. A session holds at most 16 queued jobs in total (turns, evaluations, context); beyond that `429 turn_queue_full`.
+- Nothing changes until the user confirms the exact proposal in the companion UI. Only explicit absolute values are proposed (budget incl. delivery, size, firmness, return nights/days/weeks); relative changes ("$100 more") are rejected. A newer update supersedes an open one. While an update is pending, proposed, failed or stale, cues are at most ASK (a known violation still shows PAUSE).
+- Errors: 409 `update_id_reused`, `stale_update`; 412 `goals_unconfirmed`; 422 `context_update_unsupported` (lunch), `unsupported_trigger` (only `three_waves`), `field_too_long`, `empty_transcript`, `transcript_too_long`.
 
 ## Message shapes
 
