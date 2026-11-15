@@ -13,8 +13,8 @@ use crate::events::Hub;
 use crate::events::allowed;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
-use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Exactly what the pipeline produced, plus the turn it belongs to.
 /// A turn ends at each pause Deepgram hears. Interim text (`is_final == false`) carries the
@@ -347,6 +347,89 @@ impl Bridge {
     }
 }
 
+/// How long Python holds a cue (`CUE_HOLD_S` in pipeline/band_pipeline.py); after that the
+/// mic resumes and the band shows its mic colour again, so there is nothing left to clear.
+const CUE_HOLD: Duration = Duration::from_secs(2);
+
+/// Thread-safe LED access for cues that are not tied to a transcript (the cue poller).
+/// Same Python `set_cue` path as `show`: Python stops BOTH the audio and mic-level streams,
+/// flushes pending speech, then calls `validate` under its mode and speech locks, and
+/// refuses while decisions mode is off or memory capture is on.
+#[derive(Clone)]
+pub struct CueHandle {
+    decisions: Arc<AtomicBool>,
+    memory: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    conversation: Arc<AtomicU64>,
+    turns: Arc<Turns>,
+    hub: Arc<Hub>,
+    pipeline: Arc<Py<PyModule>>,
+    lit_until: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Bridge {
+    pub fn cue_handle(&self) -> CueHandle {
+        CueHandle {
+            decisions: self.decisions.clone(),
+            memory: self.memory.clone(),
+            generation: self.generation.clone(),
+            conversation: self.conversation.clone(),
+            turns: self.turns.clone(),
+            hub: self.hub.clone(),
+            pipeline: Arc::new(Python::with_gil(|py| self.pipeline.clone_ref(py))),
+            lit_until: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl CueHandle {
+    /// Shows a snapshot cue (`hex` None = LED off). `still_valid` is checked before and again
+    /// at the LED operation (after the mic is off and speech flushed); any mode, memory,
+    /// conversation change or a new final transcript since the call also refuses it.
+    /// Never hold a lock `still_valid` takes while calling this (it runs under the GIL).
+    pub fn show_snapshot_cue(&self, hex: Option<&str>, pattern: &str,
+        still_valid: impl Fn() -> bool + Send + 'static) -> Result<bool, String> {
+        let (on, memory, generation, conversation, turns) = (self.decisions.clone(), self.memory.clone(),
+            self.generation.clone(), self.conversation.clone(), self.turns.clone());
+        let (g, c, latest) = (generation.load(SeqCst), conversation.load(SeqCst), turns.0.load(SeqCst));
+        if !on.load(SeqCst) || memory.load(SeqCst) || !still_valid() {
+            return Ok(false);
+        }
+        let shown = Python::with_gil(|py| -> PyResult<bool> {
+            let validate = PyCFunction::new_closure_bound(py, None, None,
+                move |_args: &Bound<'_, PyTuple>, _kw: Option<&Bound<'_, PyDict>>| -> PyResult<bool> {
+                    Ok(on.load(SeqCst) && !memory.load(SeqCst) && generation.load(SeqCst) == g
+                        && conversation.load(SeqCst) == c && turns.0.load(SeqCst) == latest && still_valid())
+                })?;
+            self.pipeline.bind(py).call_method1("set_cue", (hex, pattern, validate))?.extract::<bool>()
+        }).map_err(|e| e.to_string())?;
+        if shown {
+            self.mark_lit(hex.is_some());
+        }
+        Ok(shown)
+    }
+
+    /// Records that a custom cue (or LED off) was just shown, by either path.
+    pub fn mark_lit(&self, lit: bool) {
+        *self.lit_until.lock().unwrap() = lit.then(|| Instant::now() + CUE_HOLD);
+    }
+
+    /// LED off if a decision cue may still be showing. Ok(false) = nothing to clear, or Python
+    /// refused (mode transition): the mic colour or Python's own transition owns the LED then.
+    pub fn clear_if_lit(&self) -> Result<bool, String> {
+        let lit = self.lit_until.lock().unwrap().is_some_and(|t| Instant::now() < t);
+        if !lit {
+            return Ok(false);
+        }
+        self.show_snapshot_cue(None, "solid", || true)
+    }
+
+    #[must_use]
+    pub fn publish(&self, json: &str) -> bool {
+        self.hub.send(json)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +526,49 @@ mod tests {
             py.run_bound("def set_cue(hex, pattern, valid):\n    invalidate()\n    return valid()\n", Some(&b.pipeline.bind(py).dict()), None).unwrap();
         });
         assert!(!b.show(&transcript(2), Cue::Ask).unwrap()); // flush emitted a newer final
+    }
+
+    #[test]
+    fn snapshot_cues_use_set_cue_and_clear_only_when_lit() {
+        let pipeline = Python::with_gil(|py| {
+            PyModule::from_code_bound(py, "calls = []\ndef set_cue(hex, pattern, valid):\n    ok = valid()\n    calls.append((hex, pattern, ok))\n    return ok\n", "snap_cue_test.py", "snap_cue_test")
+                .unwrap().unbind()
+        });
+        let (_, rx) = sync_channel(32);
+        let b = Bridge {
+            decisions: Arc::new(AtomicBool::new(true)), conversation: Arc::new(AtomicU64::new(1)),
+            memory: Arc::new(AtomicBool::new(false)), decision_turn: Arc::new(AtomicU64::new(0)),
+            rx, turns: Arc::new(Turns::default()), hub: Arc::new(Hub::default()), pipeline,
+            generation: Arc::new(AtomicU64::new(1)),
+        };
+        let h = b.cue_handle();
+        let calls = || Python::with_gil(|py| b.pipeline.bind(py).getattr("calls").unwrap().len().unwrap());
+        assert!(!h.clear_if_lit().unwrap()); // nothing shown: no mic pause
+        assert!(!h.show_snapshot_cue(Some("#ff0000"), "blink", || false).unwrap());
+        assert_eq!(calls(), 0); // refused before Python
+        assert!(h.show_snapshot_cue(Some("#ff0000"), "blink", || true).unwrap());
+        assert!(h.clear_if_lit().unwrap()); // lit: LED off through set_cue(None)
+        assert!(!h.clear_if_lit().unwrap());
+        b.memory.store(true, SeqCst);
+        assert!(!h.show_snapshot_cue(Some("#ff0000"), "blink", || true).unwrap()); // memory capture
+        b.memory.store(false, SeqCst);
+        b.decisions.store(false, SeqCst);
+        assert!(!h.show_snapshot_cue(Some("#ff0000"), "blink", || true).unwrap()); // decisions off
+        b.decisions.store(true, SeqCst);
+        Python::with_gil(|py| {
+            let latest = b.turns.clone();
+            let flush = PyCFunction::new_closure_bound(py, None, None,
+                move |_args: &Bound<'_, PyTuple>, _kw: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
+                    latest.assign(true);
+                    Ok(())
+                }).unwrap();
+            b.pipeline.bind(py).setattr("flush", flush).unwrap();
+            py.run_bound("def set_cue(hex, pattern, valid):\n    flush()\n    return valid()\n", Some(&b.pipeline.bind(py).dict()), None).unwrap();
+        });
+        assert!(!h.show_snapshot_cue(Some("#ff0000"), "blink", || true).unwrap()); // a final arrived during the flush
+        Python::with_gil(|py| {
+            let c: Vec<(Option<String>, String, bool)> = b.pipeline.bind(py).getattr("calls").unwrap().extract().unwrap();
+            assert_eq!(c, vec![(Some("#ff0000".into()), "blink".into(), true), (None, "solid".into(), true)]);
+        });
     }
 }

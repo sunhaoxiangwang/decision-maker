@@ -7,6 +7,7 @@
 //!   add --cue to answer every final turn with an Ask cue (tests the LED path)
 use decision_maker::bridge::{Bridge, Cue, Purpose};
 use decision_maker::copilot::{self, Copilot};
+use decision_maker::cue_poll::{self, Step};
 use std::time::Instant;
 
 fn main() {
@@ -29,6 +30,12 @@ fn main() {
     if copilot.is_none() {
         eprintln!("COPILOT_BRIDGE_TOKEN not set: transcripts are not sent to the copilot server.");
     }
+    // One cue model for polled cues and turn results: stale cues never reach the LED.
+    let model = cue_poll::new_model();
+    let cues = bridge.cue_handle();
+    if let Some(poller) = Copilot::from_env() {
+        cue_poll::spawn(poller, model.clone(), cues.clone());
+    }
     while let Some(t) = bridge.next_transcript() {
         let queued = t.received.elapsed().as_micros();
         println!(
@@ -36,22 +43,40 @@ fn main() {
             t.conversation, t.turn_id, t.speaker, t.is_final, t.purpose, t.text
         );
         if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Conversation) {
+            let epoch = cue_poll::capture(&mut model.lock().unwrap()); // no cues until this turn's response
+            cue_poll::apply(&cues, &model, "", &Step::LedOff("capture"), &serde_json::Value::Null);
             match c.submit(t.turn_id, &t.text, t.speaker) {
                 Ok(result) => {
                     let snap = &result["snapshot"];
                     if let Some(ev) = copilot::decision_event(t.turn_id, snap, now_ms()) {
                         let _ = bridge.publish(&ev); // UI only; the LED below does not depend on it
                     }
-                    if let Some(cue) = copilot::cue_of(snap) {
-                        println!("  copilot {} -> {:?}", snap["outcome"], bridge.show(&t, cue));
+                    let step = cue_poll::on_turn_result(&mut model.lock().unwrap(), &epoch, &result);
+                    match (&step, copilot::cue_of(snap)) {
+                        (Step::Apply { rev, .. }, Some(cue)) => {
+                            println!("  decision received rev {rev}: copilot {}", snap["outcome"]);
+                            let shown = bridge.show(&t, cue);
+                            if let Ok(true) = shown {
+                                cues.mark_lit(cue.led().is_some());
+                            }
+                            println!("  LED applied rev {rev}: {shown:?}");
+                        }
+                        (Step::Ignore(why), _) => println!("  copilot {} not applied: {why}", snap["outcome"]),
+                        _ => {
+                            let sid = model.lock().unwrap().session.clone().unwrap_or_default();
+                            cue_poll::apply(&cues, &model, &sid, &step, snap)
+                        }
                     }
                 }
-                Err(e) => eprintln!("  {e}"),
+                Err(e) => eprintln!("  {e}"), // stays awaiting: fail closed until a newer turn is accepted
             }
         } else if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Context) {
             // goal update spoken between waves: proposal only, never an LED cue
             match c.context_update(t.turn_id, &t.text) {
-                Ok(r) => println!("  context update {} -> {} (confirm in the copilot UI)", r["update"]["update_id"], r["status"]),
+                Ok(r) => {
+                    cue_poll::on_context_result(&mut model.lock().unwrap(), &r);
+                    println!("  context update {} -> {} (confirm in the copilot UI)", r["update"]["update_id"], r["status"])
+                }
                 Err(e) => eprintln!("  {e}"),
             }
         } else if cue && t.is_final && t.purpose == Purpose::Conversation {
