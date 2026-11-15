@@ -67,23 +67,46 @@ pub fn on_cue(m: &mut BridgeModel, snap: &Value) -> Step {
     }
 }
 
-/// A final conversation transcript is being submitted: new capture epoch. No cue applies
-/// until this epoch's turn response arrives. Returns the epoch's client_turn_id.
-pub fn capture(m: &mut BridgeModel) -> String {
-    let (id, _led_off) = m.capture_start();
+/// A final conversation transcript is being submitted as `submitted_id` (the exact
+/// client_turn_id sent to the copilot): new capture epoch. No cue applies until the response
+/// for that ID arrives; the model awaits the real submitted ID, not an internal label.
+pub fn capture(m: &mut BridgeModel, submitted_id: &str) -> String {
+    let _ = m.capture_start();
+    m.awaiting = Some((m.epoch, submitted_id.to_string()));
     m.mic_stopped(); // the turn's speech is complete (Deepgram final)
-    id
+    submitted_id.to_string()
 }
 
-/// The synchronous response to this epoch's submission (`turn_result`).
-pub fn on_turn_result(m: &mut BridgeModel, client_turn_id: &str, result: &Value) -> Step {
+/// The synchronous response to the submission of `submitted_id` (`turn_result`).
+///
+/// A response never changes the model's instance/session/mode: identity comes only from
+/// session discovery (`on_active`). A late response from an older session or instance, or a
+/// response for any other submission, is rejected without touching the model, so it can
+/// never switch the model back or bring back an old cue. The only exception is a bridge that
+/// has not discovered any session yet (nothing current to protect).
+pub fn on_turn_result(m: &mut BridgeModel, submitted_id: &str, result: &Value) -> Step {
     let Some((instance, session, mode)) = ids(result) else {
         return Step::Ignore("malformed turn_result");
     };
-    let changed = m.on_session(&instance, &session, mode).contains(&Action::LedOff);
-    m.on_turn_response(&instance, &session, mode, client_turn_id, result["turn"]["server_seq"].as_u64());
+    if m.instance.is_none() && m.session.is_none() {
+        // first identity ever seen: the in-flight submission necessarily belongs to it
+        let awaiting = m.awaiting.take();
+        m.on_session(&instance, &session, mode);
+        m.awaiting = awaiting;
+    } else if m.instance.as_deref() != Some(instance.as_str())
+        || m.session.as_deref() != Some(session.as_str())
+        || m.mode != Some(mode)
+    {
+        return Step::Ignore("response from another instance/session/mode");
+    }
+    if result["turn"]["client_turn_id"].as_str() != Some(submitted_id) {
+        return Step::Ignore("response for another submission");
+    }
+    if m.awaiting.as_ref().map(|(_, id)| id.as_str()) != Some(submitted_id) {
+        return Step::Ignore("submission no longer awaited");
+    }
+    m.on_turn_response(&instance, &session, mode, submitted_id, result["turn"]["server_seq"].as_u64());
     match &result["snapshot"] {
-        Value::Null if changed => Step::LedOff("new instance/session/mode"),
         Value::Null => Step::Ignore("no snapshot"),
         snap => on_cue(m, snap),
     }
@@ -256,7 +279,7 @@ mod tests {
     #[test]
     fn generation_below_min_is_ignored() {
         let mut m = ready();
-        let id = capture(&mut m);
+        let id = capture(&mut m, "x");
         let turn = |seq: u64, snapshot: Value| json!({"instance_id": "i1", "session_id": "s1", "mode": "negotiation",
             "kind": "turn_result", "turn": {"client_turn_id": "x", "server_seq": seq}, "snapshot": snapshot});
         assert_eq!(on_turn_result(&mut m, &id, &turn(4, Value::Null)), Step::Ignore("no snapshot"));
@@ -271,7 +294,7 @@ mod tests {
     #[test]
     fn capture_in_progress_blocks_cues_until_this_epochs_response() {
         let mut m = ready();
-        let id = capture(&mut m);
+        let id = capture(&mut m, "boot-7");
         assert_eq!(on_cue(&mut m, &snap("i1", "s1", 3, 0, "decided", red())), Step::Ignore("awaiting submission acknowledgement"));
         m.mic_active = true;
         assert_eq!(on_cue(&mut m, &snap("i1", "s1", 3, 0, "decided", red())), Step::Ignore("capturing"));
@@ -279,10 +302,107 @@ mod tests {
         // a response for another submission does not unblock
         let r = |cid: &str| json!({"instance_id": "i1", "session_id": "s1", "mode": "negotiation",
             "turn": {"client_turn_id": cid, "server_seq": 1}, "snapshot": snap("i1", "s1", 4, 1, "decided", red())});
-        assert_eq!(on_turn_result(&mut m, "b-999", &r("b-999")), Step::Ignore("awaiting submission acknowledgement"));
+        assert_eq!(on_turn_result(&mut m, &id, &r("b-999")), Step::Ignore("response for another submission"));
+        assert_eq!(m.awaiting.as_ref().map(|(_, a)| a.as_str()), Some("boot-7"), "still awaiting the real submission");
         assert_eq!(on_turn_result(&mut m, &id, &r(&id)), red_apply(4));
         // the poller later sees the same rev: not applied twice
         assert_eq!(on_cue(&mut m, &snap("i1", "s1", 4, 1, "decided", red())), Step::Ignore("revision not newer"));
+    }
+
+    fn green() -> Value {
+        json!({"kind": "decision", "name": "green", "rgb": "#00FF00", "pattern": "solid", "period_ms": null})
+    }
+
+    fn green_apply(rev: u64) -> Step {
+        Step::Apply { rev, hex: "#00ff00".into(), pattern: "solid".into() }
+    }
+
+    fn response(instance: &str, session: &str, cid: &str, seq: u64, rev: u64, cue: Value) -> Value {
+        json!({"instance_id": instance, "session_id": session, "mode": "negotiation", "kind": "turn_result",
+               "turn": {"client_turn_id": cid, "server_seq": seq}, "snapshot": snap(instance, session, rev, seq, "decided", cue)})
+    }
+
+    #[test]
+    fn late_response_from_old_session_cannot_switch_back_or_light_green() {
+        let mut m = ready(); // i1 / s1
+        let id = capture(&mut m, "boot-1");
+        // the poller discovers a new session while the old submission is in flight
+        assert_eq!(on_active(&mut m, &info("i1", "s2")), Ok(("s2".into(), true)));
+        // the late old-session response (green) is rejected and changes nothing
+        let before = m.clone();
+        assert_eq!(
+            on_turn_result(&mut m, &id, &response("i1", "s1", "boot-1", 3, 9, green())),
+            Step::Ignore("response from another instance/session/mode")
+        );
+        assert_eq!(m, before, "model untouched: still s2, nothing awaited or applied");
+        assert_eq!(m.session.as_deref(), Some("s2"));
+        // later polls: the old session stays rejected, the new one applies
+        assert_eq!(on_cue(&mut m, &snap("i1", "s1", 10, 3, "decided", green())), Step::LedOff("instance/session/mode mismatch"));
+        assert_eq!(on_cue(&mut m, &snap("i1", "s2", 2, 0, "decided", red())), red_apply(2));
+    }
+
+    #[test]
+    fn late_response_from_old_instance_after_restart_is_rejected() {
+        let mut m = ready(); // i1 / s1
+        let id = capture(&mut m, "boot-1");
+        assert_eq!(on_active(&mut m, &info("i2", "s1")), Ok(("s1".into(), true))); // server restarted
+        let before = m.clone();
+        assert_eq!(
+            on_turn_result(&mut m, &id, &response("i1", "s1", "boot-1", 3, 9, green())),
+            Step::Ignore("response from another instance/session/mode")
+        );
+        assert_eq!(m, before);
+        assert_eq!(m.instance.as_deref(), Some("i2"));
+    }
+
+    #[test]
+    fn resend_into_new_session_waits_for_the_poller() {
+        // the submission was resent into the newly discovered session after the model reset:
+        // the response matches the identity, but its submission is no longer awaited, so it is
+        // not applied directly; the poller delivers the new session's cue instead
+        let mut m = ready();
+        let id = capture(&mut m, "boot-1");
+        assert_eq!(on_active(&mut m, &info("i1", "s2")), Ok(("s2".into(), true)));
+        assert_eq!(
+            on_turn_result(&mut m, &id, &response("i1", "s2", "boot-1", 1, 4, green())),
+            Step::Ignore("submission no longer awaited")
+        );
+        assert_eq!(m.last_rev, 0);
+        assert_eq!(on_cue(&mut m, &snap("i1", "s2", 4, 1, "decided", green())), green_apply(4));
+    }
+
+    #[test]
+    fn response_must_carry_the_exact_submitted_id() {
+        let mut m = ready();
+        let id = capture(&mut m, "1794000000000-7");
+        for other in ["1794000000000-6", "bridge-1", "x", ""] {
+            assert_eq!(
+                on_turn_result(&mut m, &id, &response("i1", "s1", other, 2, 5, green())),
+                Step::Ignore("response for another submission")
+            );
+        }
+        let mut no_turn = response("i1", "s1", "", 2, 5, green());
+        no_turn["turn"] = Value::Null;
+        assert_eq!(on_turn_result(&mut m, &id, &no_turn), Step::Ignore("response for another submission"));
+        assert_eq!(m.last_rev, 0);
+        assert!(m.awaiting.is_some(), "still awaiting");
+        assert_eq!(on_turn_result(&mut m, &id, &response("i1", "s1", &id, 2, 5, green())), green_apply(5));
+        assert!(m.awaiting.is_none());
+    }
+
+    #[test]
+    fn first_identity_is_adopted_only_before_any_discovery() {
+        let mut m = BridgeModel::new("b");
+        let id = capture(&mut m, "boot-1");
+        assert_eq!(on_turn_result(&mut m, &id, &response("i1", "s1", "boot-1", 1, 3, red())), red_apply(3));
+        assert_eq!((m.instance.as_deref(), m.session.as_deref()), (Some("i1"), Some("s1")));
+        // once an identity exists, a response can never replace it
+        let id = capture(&mut m, "boot-2");
+        assert_eq!(
+            on_turn_result(&mut m, &id, &response("i1", "s9", "boot-2", 2, 4, green())),
+            Step::Ignore("response from another instance/session/mode")
+        );
+        assert_eq!(m.session.as_deref(), Some("s1"));
     }
 
     #[test]

@@ -43,15 +43,19 @@ fn main() {
             t.conversation, t.turn_id, t.speaker, t.is_final, t.purpose, t.text
         );
         if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Conversation) {
-            let epoch = cue_poll::capture(&mut model.lock().unwrap()); // no cues until this turn's response
+            let submitted = c.client_turn_id(t.turn_id);
+            cue_poll::capture(&mut model.lock().unwrap(), &submitted); // no cues until this ID's response
             cue_poll::apply(&cues, &model, "", &Step::LedOff("capture"), &serde_json::Value::Null);
             match c.submit(t.turn_id, &t.text, t.speaker) {
                 Ok(result) => {
                     let snap = &result["snapshot"];
-                    if let Some(ev) = copilot::decision_event(t.turn_id, snap, now_ms()) {
-                        let _ = bridge.publish(&ev); // UI only; the LED below does not depend on it
+                    // validated first: a stale or foreign response reaches neither the UI nor the LED
+                    let step = cue_poll::on_turn_result(&mut model.lock().unwrap(), &submitted, &result);
+                    if !matches!(step, Step::Ignore(_)) {
+                        if let Some(ev) = copilot::decision_event(t.turn_id, snap, now_ms()) {
+                            let _ = bridge.publish(&ev); // UI only; the LED below does not depend on it
+                        }
                     }
-                    let step = cue_poll::on_turn_result(&mut model.lock().unwrap(), &epoch, &result);
                     match (&step, copilot::cue_of(snap)) {
                         (Step::Apply { rev, .. }, Some(cue)) => {
                             println!("  decision received rev {rev}: copilot {}", snap["outcome"]);

@@ -71,6 +71,11 @@ impl Copilot {
         Some(Copilot { addr, token, boot, seq: AtomicU64::new(0), session: Mutex::new(None) })
     }
 
+    /// The exact `client_turn_id` `submit` sends for `turn_id` (unique per bridge boot).
+    pub fn client_turn_id(&self, turn_id: u64) -> String {
+        format!("{}-{turn_id}", self.boot)
+    }
+
     /// Submits one final turn and returns the `turn_result` (its `snapshot` is the cue, if any).
     pub fn submit(&self, turn_id: u64, text: &str, speaker: Option<u32>) -> Result<Value, String> {
         let speaker = speaker.map_or("unknown".into(), |s| format!("speaker{s}"));
@@ -78,7 +83,7 @@ impl Copilot {
             let sid = &a.session_id;
             (format!("/v1/sessions/{sid}/turns"), json!({
                 "protocol": "vexo-copilot/1", "session_id": sid, "mode": a.mode,
-                "source_id": "cy-bridge", "client_turn_id": format!("{}-{turn_id}", self.boot),
+                "source_id": "cy-bridge", "client_turn_id": self.client_turn_id(turn_id),
                 "source_seq": seq,
                 "transcript": {"text": text, "transcript_source": "deepgram", "speaker": speaker},
             }))
