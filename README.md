@@ -142,7 +142,7 @@ npm run dev -- --port 3000
 Open **http://localhost:3000**, the bridge's allowed browser origin. Speech events come directly from `http://127.0.0.1:8787/events`. Keep this page open while recording. Audio is sent to Deepgram while the microphone is on; tell people nearby before recording.
 
 - Triple-tap: conversation capture on/off. Green/red flashes acknowledge the change.
-- Wave: record memory until the next wave. Finished transcript turns are saved as given.
+- Three waves (any direction, all within 8 s): record memory until the next three waves. One or two waves do nothing. Finished transcript turns are saved as given; with the copilot configured, each final turn is sent as a `three_waves` context update that stays pending until confirmed in the copilot UI (never an LED cue).
 - The mic is paused during activation flashes (2 s), wave acknowledgement (0.8 s), and optional demo cues (2 s). Wait for blue/the live mic indicator before speaking. These gaps are real missing audio, not buffered audio.
 - `--cue` is only a fixed Ask LED demo; it does not generate decisions.
 
@@ -153,7 +153,7 @@ sh scripts/setup.sh --typed   # creates the Python environment and UI dependenci
 cargo run -- --typed
 ```
 
-Enter `/triple`, transcript lines, `/wave`, more transcript lines, `/wave`, and `/triple`.
+Enter `/triple`, transcript lines, `/wave`, more transcript lines, `/wave`, and `/triple`. Typed `/wave` simulates the three-wave gesture: its context is shown in the UI but never sent to the copilot as `three_waves`.
 
 ## Bounds and failure behavior
 

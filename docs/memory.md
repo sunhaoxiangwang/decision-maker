@@ -86,11 +86,11 @@ Memory is local to the browser. This branch does not POST to the proposed memory
 
 Waving toggles continuous memory capture, including while decisions mode is off.
 
-1. Wave the band left to right three times: five fast alternating gyro swings within 3 s, detected by `WaveDetector` in `pipeline/band_pipeline.py`.
+1. Wave three times, in any direction, within 8 s (`THREE_WAVES`, `THREE_WAVE_WINDOW_MS`). Each wave is five fast alternating gyro swings within 3 s, detected by `WaveDetector` in `pipeline/band_pipeline.py` (unchanged, 1.5 s quiet after each). One or two waves do not start or stop capture.
 2. Rust receives `set_memory_mode(true)` and broadcasts `{"type":"gesture","name":"wave","memory":true,"time_ms":...}`. The band flashes white for 0.8 s with the mic off, then listens (blue).
 3. Every spoken turn until the next wave is `purpose:"context"` / Rust `Purpose::Context`. Pauses do not stop capture. Decision cues are suspended during capture; context never joins conversation history.
 4. Each final turn is saved exactly as received, separated by a newline, in one confirmed memory item for this capture. No extraction, model call, editing step or confirmation is required. Existing memory is kept. Saving each finished turn also preserves it across a browser reload.
-5. Wave again. The mic stops and the speech connection drains before Rust receives `set_memory_mode(false)`. The UI closes the capture indicator. If decisions mode was on, conversation listening resumes; otherwise the mic and LED turn off after the white flash.
+5. Wave three times again. The mic stops and the speech connection drains before Rust receives `set_memory_mode(false)`. The UI closes the capture indicator. If decisions mode was on, conversation listening resumes; otherwise the mic and LED turn off after the white flash.
 6. Triple-tapping also stops and saves any active memory capture before switching decisions mode. A new speech connection at each boundary prevents conversation and memory words from mixing.
 
 Mode, memory and actual mic status are sent to a UI connecting later. Native EventSource reconnect can catch up within the bounded 128-event/1-MiB replay window; gaps outside that window are disclosed. The UI must remain open during recording to save new speech. Memory and conversation history are kept in that browser's localStorage. The proposed orchestrator memory endpoint is still not implemented.
@@ -98,7 +98,7 @@ Mode, memory and actual mic status are sent to a UI connecting later. Native Eve
 Calibration on the real band remains necessary:
 - `VEXO_GESTURE_DEBUG=1` prints tap events and peak turning rate on each gyro axis.
 - Adjust `WAVE_AXIS`, `WAVE_DPS`, and tap sensitivity from actual measurements.
-- In typed mode, `/wave` runs the same toggle callback and `/triple` toggles decisions.
+- In typed mode, `/wave` runs the same toggle callback (a simulated three-wave gesture) and `/triple` toggles decisions. Typed context is never sent to the copilot as trigger `three_waves` (src/main.rs prints a note instead).
 
 ## Verification
 

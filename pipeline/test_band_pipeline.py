@@ -56,7 +56,7 @@ assert not swing(1500, -300)                # quiet for 1.5 s after a wave
 w2 = bp.WaveDetector(dps=150, swings=5, window_ms=3000)
 assert not any(w2.feed(t, r) for t, r in [(0, 300), (2000, -300), (4000, 300), (6000, -300), (8000, 300)])  # too slow overall
 
-# Both modes start off. Waves toggle continuous capture, including with decisions off.
+# Both modes start off. Three waves toggle continuous capture, including with decisions off.
 sent, modes, memory_modes = [], [], []
 bp.emit = lambda text, speaker, final, purpose: sent.append((text, final, purpose))
 bp.set_mode = modes.append
@@ -64,13 +64,13 @@ bp.set_memory_mode = memory_modes.append
 bp.ears = None
 bp._emit("off", True)
 assert sent == []
-bp.on_wave()
+bp.on_three_waves()
 assert bp.memory_on and not bp.decisions_on
 bp._emit("Budget is now $1,300.", True)
 bp._emit("And delivery", False)
 bp._emit("And delivery must be included.", True)
 assert all(s[2] == "context" for s in sent)
-bp.on_wave()
+bp.on_three_waves()
 assert not bp.memory_on and memory_modes == [True, False]
 n = len(sent)
 bp._emit("after memory off", True)
@@ -79,16 +79,16 @@ bp.toggle_decisions()
 assert bp.decisions_on and modes == [True]
 bp._emit("conversation", True)
 assert sent[-1][2] == "conversation"
-bp.on_wave()
+bp.on_three_waves()
 assert not bp.set_cue("#00ff00", "solid")
 bp._emit("context one", True)
 bp._emit("context two", True)
 assert [s[2] for s in sent[-2:]] == ["context", "context"]
-bp.on_wave()
+bp.on_three_waves()
 bp._emit("conversation again", True)
 assert sent[-1][2] == "conversation"
 assert bp.set_cue("#00ff00", "solid")
-bp.on_wave()
+bp.on_three_waves()
 bp.toggle_decisions()  # stopping decisions also stops active memory capture
 assert not bp.decisions_on and not bp.memory_on
 assert modes == [True, False]
@@ -202,18 +202,26 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
                 pass
         assert fake.audio and bp._resume is None
         bp.ears.pending = "last conversation words"
-        def wave(start):
-            for i, rate in enumerate([300, -300, 300, -300, 300]):
-                fake.handlers["motion"](SimpleNamespace(t=start + i * 200, gz=rate))
+        def wave(start, first=300):  # one wave: five alternating swings, 200 ms apart
+            for i in range(5):
+                fake.handlers["motion"](SimpleNamespace(t=start + i * 200, gz=first if i % 2 == 0 else -first))
+
+        def three_waves(start):  # detected at start+0.8 s, +3.2 s, +5.6 s; direction does not matter
+            for k, first in enumerate([300, -300, 300]):
+                wave(start + k * 2400, first)
 
         wave(0)
+        wave(2400)  # two waves (detected at 0.8 s and 3.2 s): nothing changes, nothing is captured as context
+        assert not bp.memory_on and memory_modes == [] and bp.decisions_on
+        assert sent[-1][2] == "conversation"
+        three_waves(12000)  # the two earlier waves are > 8 s old: only the third of these toggles
         assert bp.memory_on and memory_modes == [True]
         assert sent[-1] == ("last conversation words", True, "conversation")
         bp._resume.callback()
         assert fake.audio
         bp._emit("memory first", True)
         bp.ears.pending = "memory last words"
-        wave(3000)
+        three_waves(22000)
         assert not bp.memory_on and memory_modes == [True, False]
         assert sent[-1] == ("memory last words", True, "context")
         bp._resume.callback()
@@ -231,12 +239,12 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
         bp._resume.callback()
         assert fake.calls[-1] == ("off",)
 
-    wave(6000)  # memory starts even with decisions off
+    three_waves(32000)  # memory starts even with decisions off
     assert bp.memory_on and not bp.decisions_on
     bp._resume.callback()
     assert fake.audio
     bp.ears.pending = "standalone memory"
-    wave(9000)
+    three_waves(42000)
     assert not bp.memory_on and not bp.decisions_on
     assert sent[-1] == ("standalone memory", True, "context")
     bp._resume.callback()
@@ -248,10 +256,73 @@ with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer",
     with patch.object(FakeEars, "start", fail_start):
         bp.toggle_decisions()
         assert not bp.decisions_on and bp.ears is None
-        bp.on_wave()
+        bp.on_three_waves()
         assert not bp.memory_on and bp.ears is None
 
 print("registered gestures, LEDs, drain and failures ok")
+
+# ---- three waves --------------------------------------------------------------------------
+# The registered motion handler: only THREE_WAVES detected waves within THREE_WAVE_WINDOW_MS
+# toggle memory. Fewer, or spread wider, never call set_memory_mode, so no speech is captured
+# as context (the only purpose Rust sends to the copilot as trigger three_waves).
+assert (bp.THREE_WAVES, bp.THREE_WAVE_WINDOW_MS) == (3, 8000)
+bp.band = fake = FakeBand()
+bp.decisions_on, bp.memory_on, bp._capture_failed, bp.ears = False, False, False, None
+memory_modes.clear()
+toggles = []
+with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer", FakeTimer), \
+        patch.object(bp.threading, "Thread", ImmediateThread), \
+        patch.object(bp, "on_three_waves", lambda: toggles.append(True)):
+    bp._watch_gestures()
+
+    def wave_at(start, first=300):
+        for i in range(5):
+            fake.handlers["motion"](SimpleNamespace(t=start + i * 200, gz=first if i % 2 == 0 else -first))
+
+    wave_at(0)                                   # wave 1 (detected at 800)
+    assert toggles == []
+    wave_at(2400, -300)                          # wave 2, starting the other way (3200)
+    assert toggles == []
+    wave_at(10000)                               # wave 3 at 10800: wave 1 is > 8 s old
+    assert toggles == []
+    wave_at(12400, -300)                         # 3200, 10800, 13200 ... 3200 has expired too
+    assert toggles == []
+    wave_at(14800)                               # 10800, 13200, 15600: three within 8 s
+    assert toggles == [True]
+    wave_at(30000, -300)
+    wave_at(32400, 300)
+    assert toggles == [True]                     # two more: nothing
+    wave_at(34800, -300)                         # three more: toggles again (off)
+    assert toggles == [True, True]
+    wave_at(50000)                               # the count restarts after each toggle
+    assert toggles == [True, True]
+    for start in (60000, 62400, 64800):          # slow single swings are not waves at all
+        fake.handlers["motion"](SimpleNamespace(t=start, gz=300))
+    assert toggles == [True, True]
+assert memory_modes == [] and not bp.memory_on   # (on_three_waves was stubbed: counting only)
+
+# The same counts through the real toggle: one or two waves leave capture off and emit nothing.
+sent.clear()
+bp.band = fake = FakeBand()
+with patch.object(bp, "Diarized", FakeEars), patch.object(bp.threading, "Timer", FakeTimer), \
+        patch.object(bp.threading, "Thread", ImmediateThread):
+    bp._watch_gestures()
+    wave_at(0)
+    wave_at(2400, -300)
+    bp._emit("said after two waves", True)
+    assert not bp.memory_on and memory_modes == [] and sent == []
+    wave_at(4800)
+    assert bp.memory_on and memory_modes == [True]
+    bp._resume.callback()
+    bp._emit("said after three waves", True)
+    assert sent == [("said after three waves", True, "context")]
+    for k, start in enumerate((20000, 22400)):
+        wave_at(start, 300 if k % 2 else -300)
+        assert bp.memory_on and memory_modes == [True]  # one or two waves do not stop it
+    wave_at(24800, -300)
+    assert not bp.memory_on and memory_modes == [True, False]
+    bp._resume.callback()
+print("three waves toggle, one or two do not, the window and any direction ok")
 
 if speech is not None:
     # Continuous recognized speech is segmented without retaining all past final text.
