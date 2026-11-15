@@ -10,9 +10,8 @@ Decisions mode (triple tap toggles it; off at start):
        then the mic: conversation turns are sent and saved for decisions.
   off: red blinks 5 times, the mic stops (nothing is heard, sent or saved), the light goes off.
 
-Turns end on Deepgram's UtteranceEnd: a gap after the last recognised *word*, worked out from
-the transcript's word timings, so background noise cannot hold a turn open the way it holds
-open the audio silence detector (speech_final, ignored here).
+Turns end on Deepgram's speech_final after a 300 ms audio pause. UtteranceEnd remains a
+fallback based on a gap after the last recognised word, even with background noise.
 
 One wave (THREE_WAVES = 1, any direction) starts memory capture, even with decisions off;
 the next wave stops it. All turns until that next wave are
@@ -34,7 +33,8 @@ KIT = Path(__file__).resolve().parent.parent / "vexo-open-kit"
 sys.path.insert(0, str(KIT / "examples" / "python"))  # speech.py (finds the library itself)
 sys.path.insert(0, str(KIT / "python"))  # vexo_open: run() needs it before speech is imported
 
-UTTERANCE_END_MS = 1000  # gap after the last word that ends a turn (Deepgram's minimum is 1000)
+ENDPOINTING_MS = 300    # primary turn boundary: audio pause
+UTTERANCE_END_MS = 1000  # word-gap fallback (Deepgram's minimum is 1000)
 CUE_HOLD_S = 2.0         # the light only shows with the mic off; speech in this window is not heard
 
 # ponytail: gesture thresholds are guesses until measured on band 48. VEXO_GESTURE_DEBUG=1
@@ -84,6 +84,7 @@ def Diarized(**options):
         speaker = None
 
         def __init__(self):
+            options.setdefault("endpointing", ENDPOINTING_MS)
             super().__init__(diarize="true", utterance_end_ms=UTTERANCE_END_MS, **options)
             self._utterance_started = time.monotonic()
 
@@ -130,7 +131,8 @@ def Diarized(**options):
         def _message(self, message):
             with _speech_lock:
                 if message.get("type") == "UtteranceEnd":
-                    self._sentence_ends()
+                    if message.get("last_word_end") != -1:
+                        self._sentence_ends()
                     return
                 alts = (message.get("channel") or {}).get("alternatives") or [{}]
                 words = alts[0].get("words") or []
@@ -147,8 +149,8 @@ def Diarized(**options):
                     if (len(" ".join(self._parts + [piece]).encode("utf-8")) > MAX_TEXT_BYTES
                             or time.monotonic() - self._utterance_started >= MAX_UTTERANCE_S):
                         self._sentence_ends()
-                # The audio VAD never ends a turn. UtteranceEnd, time or size does.
-                super()._message(dict(message, speech_final=False))
+                # Honor the faster endpoint; UtteranceEnd still handles noisy pauses.
+                super()._message(message)
 
         def _sentence_ends(self):
             with _speech_lock:

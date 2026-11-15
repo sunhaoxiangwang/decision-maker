@@ -1,5 +1,6 @@
 'use client';
 import Link from 'next/link';
+import Image from 'next/image';
 import MemoryCapture from '@/components/MemoryCapture';
 import Conversation from '@/components/Conversation';
 import { CueScale } from '@/components/CueBadge';
@@ -8,7 +9,7 @@ import { useNames } from '@/lib/names';
 import { selectedTurn, visibleTurns } from '@/lib/store';
 import { useBridge } from '@/lib/useBridge';
 
-const MIC = { live: '● Mic live', 'cue-hold': 'Mic paused for cue', off: 'Mic off' } as const;
+const MIC = { live: 'Mic live', 'cue-hold': 'Mic paused for cue', off: 'Mic off' } as const;
 
 export default function Live() {
   const { state, dispatch, link } = useBridge();
@@ -32,16 +33,15 @@ export default function Live() {
     <div className="split">
       <section className="chat">
         <header className="topbar">
-          <h1 className="title">Live</h1>
-          <span className={`chip${status?.mic === 'live' ? ' rec' : ''}`}>{status ? MIC[status.mic] : 'Mic unknown'}</span>
+          <span className={`status-indicator${status?.mic === 'live' ? ' on' : ''}`}>{status ? MIC[status.mic] : 'Mic unknown'}</span>
           {state.decisionsOn !== null && (
-            <span className={`chip${state.decisionsOn ? ' on' : ''}`} title="Triple-tap the band to switch">
+            <span className={`status-indicator${state.decisionsOn ? ' on' : ''}`} title="Triple-tap the band to switch">
               Decisions {state.decisionsOn ? 'on' : 'off'}
             </span>
           )}
-          {state.context && <span className="chip rec">Recording memory</span>}
+          {state.context && <span className="status-indicator rec">Recording memory</span>}
           {!empty && state.decisionsOn !== false && (
-            <button className="ghost" title="Keep this conversation in Memory › Past conversations and start a new one"
+            <button className="new-conversation" title="Keep this conversation in Memory › Past conversations and start a new one"
               onClick={() => dispatch({ type: 'new-conversation' })}>New conversation</button>
           )}
         </header>
@@ -53,6 +53,7 @@ export default function Live() {
         <div className="thread">
           {state.decisionsOn === false ? (
             <div className="empty">
+              <Image src="/vexo-loader.webp" alt="Vexo band" width={120} height={120} unoptimized style={{ display: 'block', margin: '0 auto 20px' }} />
               <h1>Decisions mode is off</h1>
               <p className="muted">
                 Triple-tap the band to start. It blinks green five times, then listens: a new conversation opens here
@@ -74,42 +75,28 @@ export default function Live() {
             <Conversation state={state} onPick={(turn_id) => dispatch({ type: 'pin', turn_id })} />
           )}
         </div>
-        <div className="dock">
-          <MemoryCapture state={state} />
-          <p className="fine">
-            Goals are free text in the copilot (http://127.0.0.1:8787/); a wave adds what you say to them.
-          </p>
-        </div>
+        {state.context && <div className="dock"><MemoryCapture state={state} /></div>}
       </section>
       <aside className="pane">
         <header>
-          <h2>Decision{sel != null && ` · turn ${sel}`}</h2>
+          <h2>Decision{sel != null && <span className="turn-number">Turn {sel}</span>}</h2>
           {state.pinned != null && <button className="ghost" onClick={() => dispatch({ type: 'pin', turn_id: null })}>Follow latest</button>}
         </header>
-        {/* fixed-size window: the three lights never move; only the current call lights up */}
-        <div className="decision-window">
+        <div className={`decision-window${(turn?.cue && turn.cue !== 'Off') || d ? ' has-decision' : ''}`}>
           <CueScale cue={turn?.cue ?? d?.cue ?? 'Off'} />
           <p className="decision-reason">{d?.reason ?? (sel == null ? 'Waiting for the first finished turn.' : 'No decision for this turn.')}</p>
         </div>
-        <section>
-          <h3>Memory for {request ? `turn ${request.turn.turn_id} · ${request.turn.speaker}` : 'the next turn'}</h3>
-          {!request || request.memory.length === 0 ? (
-            <p className="muted">
-              {Object.keys(state.memory).length === 0
-                ? <>No memory yet. Add context or remember a past conversation in <Link href="/memory">Memory</Link>.</>
-                : 'No confirmed memory matches this turn.'}
-            </p>
-          ) : (
-            <ul>
-              {request.memory.map((m) => (
-                <li key={m.id}>
-                  <Link href={`/memory#m-${encodeURIComponent(m.id)}`}>{m.text}</Link>
-                  <small> · {m.kind} · {m.subject}</small>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+        {request && request.memory.length > 0 && <section>
+          <h3>Memory for turn {request.turn.turn_id} · {request.turn.speaker}</h3>
+          <ul>
+            {request.memory.map((m) => (
+              <li key={m.id}>
+                <Link href={`/memory#m-${encodeURIComponent(m.id)}`}>{m.text}</Link>
+                <small> · {m.kind} · {m.subject}</small>
+              </li>
+            ))}
+          </ul>
+        </section>}
       </aside>
     </div>
   );

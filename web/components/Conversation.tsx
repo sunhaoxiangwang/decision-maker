@@ -2,7 +2,7 @@
 import { useEffect, useRef } from 'react';
 import { selectedTurn, visibleTurns, type State } from '@/lib/store';
 
-// Speech only: the band wearer (speaker 0) on the right in a darker bubble, everyone else on
+// Speech only: the band wearer (speaker 0) on the right in a teal bubble, everyone else on
 // the left. The copilot's decision is shown in the right panel, never in the chat.
 export default function Conversation({ state, onPick }: { state: State; onPick: (turn_id: number) => void }) {
   const end = useRef<HTMLDivElement>(null);
@@ -19,6 +19,7 @@ export default function Conversation({ state, onPick }: { state: State; onPick: 
           <div key={t.turn_id} className="exchange">
             {t.text && (
               <button className={`bubble ${t.speaker === 0 ? 'you' : 'others'}${t.final ? '' : ' interim'}${selected === t.turn_id ? ' sel' : ''}`}
+                aria-pressed={selected === t.turn_id}
                 onClick={() => onPick(t.turn_id)}>
                 {t.text}
               </button>

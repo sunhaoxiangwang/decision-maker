@@ -17,6 +17,9 @@ except ModuleNotFoundError:
 if speech is not None:
     out = []
     ears = bp.Diarized()
+    assert ears.query["endpointing"] == 300, ears.query
+    assert ears.query["utterance_end_ms"] == 1000, ears.query
+    assert bp.Diarized(endpointing=500).query["endpointing"] == 500
     speech.Speech.start(ears, lambda text, final: out.append((text, ears.speaker, final)))  # no network
     ears._parts = []
 
@@ -31,11 +34,21 @@ if speech is not None:
     results("", True, speech_final=True)                 # audio VAD on silence: nothing
     assert out == [], out
     results("I can do", False)
-    results("I can do 1150", True, speech_final=True)    # speech_final must NOT end the turn
+    results("I can do 1150", True)                       # settled segment, turn still open
     assert all(not f for _, _, f in out), out
-    results("with a thirty day return", True, speaker=1)
-    ears._message({"type": "UtteranceEnd", "last_word_end": 3.1})
+    results("with a thirty day return", True, speaker=1, speech_final=True)
     assert out[-1] == ("I can do 1150 with a thirty day return", 1, True), out[-1]
+    n = len(out)
+    ears._message({"type": "UtteranceEnd", "last_word_end": 3.1})
+    assert len(out) == n                                # fallback must not duplicate the final
+    results("Delivery is included", True, speaker=1)    # noisy audio: no speech_final
+    ears._message({"type": "UtteranceEnd", "last_word_end": -1})
+    assert out[-1] == ("Delivery is included", 1, False) # stale sentinel must not end a turn
+    ears._message({"type": "UtteranceEnd", "last_word_end": 6.1})
+    assert out[-1] == ("Delivery is included", 1, True), out[-1]
+    results("No extra fees", True)
+    results("", True, speech_final=True)                # an empty endpoint drains settled text
+    assert out[-1] == ("No extra fees", 0, True), out[-1]
     n = len(out)
     ears._message({"type": "UtteranceEnd"})              # no new words: no empty turn
     assert len(out) == n

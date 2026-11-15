@@ -21,9 +21,9 @@ export default function Sidebar() {
         <Link key={href} href={href} className={path === href ? 'on' : ''} aria-current={path === href ? 'page' : undefined}>{label}</Link>
       ))}
       <div className="foot">
-        <span><Dot color={LINK[link][0]} /> {LINK[link][1]}</span>
+        <span className="connection"><Dot color={LINK[link][0]} /> {LINK[link][1]}</span>
         {storageError && <p role="alert">{storageError}</p>}
-        {state.notice && <div role="alert">{state.notice} <button className="ghost" onClick={() => dispatch({ type: 'dismiss-notice' })}>Dismiss</button></div>}
+        {state.notice && <div className="side-notice" role="alert"><p>{state.notice}</p><button className="ghost" onClick={() => dispatch({ type: 'dismiss-notice' })}>Dismiss</button></div>}
         {state.status && <span className="muted">Band {state.status.band}</span>}
       </div>
     </nav>
