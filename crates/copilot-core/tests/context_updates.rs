@@ -877,3 +877,47 @@ fn context_generation_snapshots_carry_their_own_provenance_and_null_timings() {
     assert_eq!(outcome(&s), Outcome::Proceed);
     check(&s);
 }
+
+fn ctx_firm(v: EnumValue, quote: &str) -> RawCtxChange {
+    RawCtxChange { field: CtxField::Firmness, ..ctx_size(v, quote) }
+}
+
+/// One wave in auto mode: accept, extract, commit. Returns the update's status.
+fn wave(s: &mut Session, uid: &str, text: &str, changes: Vec<RawCtxChange>) -> CtxStatus {
+    let seq = accept_ctx(s, uid, text);
+    let job = start(s, seq);
+    s.commit_context(&job, Ok(ext(changes)), 0);
+    s.context.as_ref().expect("current").status
+}
+
+#[test]
+fn auto_goals_first_waves_set_goals_and_later_waves_change_them_without_confirmation() {
+    let mut s = Session::new("auto", Mode::Negotiation, "i1", "mock");
+    s.auto_goals = true; // no goals were set in the UI
+
+    let first = "I want a queen, at most $1,500 including delivery.";
+    let st = wave(&mut s, "w1", first, vec![ctx_size(EnumValue::Queen, "a queen"), budget("1,500", "at most $1,500 including delivery")]);
+    assert_eq!(st, CtxStatus::Applied);
+    assert!(!s.goals_confirmed, "firmness and return period not stated yet: no decisions");
+    assert_eq!((s.goals.sizes.clone(), s.goals.budget_cents), (vec![EnumValue::Queen], 150_000));
+    assert!(s.context.as_ref().unwrap().rejected.iter().any(|r| r.contains("firmness") && r.contains("return_period")));
+
+    let second = "Medium firmness, and a 30-night return.";
+    wave(&mut s, "w2", second, vec![ctx_firm(EnumValue::Medium, "Medium firmness"), ctx_ret("30", DurUnit::Nights, "a 30-night return")]);
+    assert!(s.goals_confirmed, "all four stated: decisions start");
+    assert_eq!((s.goals.firmness.clone(), s.goals.min_return_nights), (vec![EnumValue::Medium], 30));
+
+    let version = s.goals_version;
+    let later = "My budget is now $1,300 including delivery.";
+    assert_eq!(wave(&mut s, "w3", later, vec![budget("1,300", "$1,300 including delivery")]), CtxStatus::Applied);
+    assert_eq!(s.goals.budget_cents, 130_000);
+    assert_eq!((s.goals.sizes.clone(), s.goals.firmness.clone(), s.goals.min_return_nights), (vec![EnumValue::Queen], vec![EnumValue::Medium], 30));
+    assert_eq!(s.goals_version, version + 1);
+}
+
+#[test]
+fn without_auto_goals_voice_still_needs_confirmed_goals_and_confirmation() {
+    let mut s = Session::new("confirm", Mode::Negotiation, "i1", "mock");
+    let e = s.accept_context(ctx_req("w1", None, "I want a queen.")).unwrap_err();
+    assert_eq!(e.code, "goals_unconfirmed");
+}

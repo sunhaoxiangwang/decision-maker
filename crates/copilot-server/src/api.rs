@@ -79,7 +79,9 @@ pub async fn host_guard(State(app): State<Arc<App>>, req: Request, next: Next) -
             .expect("hdr"),
     );
     h.insert("cache-control", "no-store".parse().expect("hdr"));
-    h.insert("referrer-policy", "no-referrer".parse().expect("hdr"));
+    // same-origin, not no-referrer: with no-referrer browsers send `Origin: null` on form posts,
+    // which check_post rejects. Other sites still receive no referrer.
+    h.insert("referrer-policy", "same-origin".parse().expect("hdr"));
     resp
 }
 
@@ -221,6 +223,29 @@ pub async fn get_active(State(app): State<Arc<App>>) -> Response {
             None,
         ),
     }
+}
+
+/// Auto voice-goals mode only: the bridge starts a negotiation session (or gets the active
+/// one), so the first wave can set the goals with no companion-UI step.
+pub async fn post_session(State(app): State<Arc<App>>) -> Response {
+    if !app.cfg.voice_goals_auto {
+        return err_env(
+            &app,
+            StatusCode::FORBIDDEN,
+            "sessions_ui_only",
+            "sessions are started in the companion UI (set COPILOT_VOICE_GOALS=auto to allow the bridge)",
+            false,
+            None,
+            None,
+            None,
+        );
+    }
+    let h = match app.active() {
+        Some(h) => h,
+        None => app.create_session(Mode::Negotiation),
+    };
+    let s = h.state.lock().expect("session");
+    Json(s.session_info(&app.request_id())).into_response()
 }
 
 pub async fn post_turn(
