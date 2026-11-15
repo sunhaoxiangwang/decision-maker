@@ -49,10 +49,14 @@ fn main() {
                 Err(e) => eprintln!("  {e}"),
             }
         } else if let (Some(c), true) = (&copilot, t.is_final && t.purpose == Purpose::Context) {
-            // goal update spoken between waves: proposal only, never an LED cue
-            match c.context_update(t.turn_id, &t.text) {
-                Ok(r) => println!("  context update {} -> {} (confirm in the copilot UI)", r["update"]["update_id"], r["status"]),
-                Err(e) => eprintln!("  {e}"),
+            // goal update spoken between three-wave gestures: proposal only, never an LED cue
+            if sends_three_waves_context(band.is_some()) {
+                match c.context_update(t.turn_id, &t.text) {
+                    Ok(r) => println!("  context update {} -> {} (confirm in the copilot UI)", r["update"]["update_id"], r["status"]),
+                    Err(e) => eprintln!("  {e}"),
+                }
+            } else {
+                println!("  TYPED context not sent to the copilot: /wave only simulates the band's three-wave gesture");
             }
         } else if cue && t.is_final && t.purpose == Purpose::Conversation {
             let start = Instant::now();
@@ -62,6 +66,25 @@ fn main() {
     }
 }
 
+/// Context updates go to the copilot with trigger `three_waves` (src/copilot.rs). That is only
+/// true with the band, where the wrapper opens a context window solely on three recognised
+/// waves (pipeline/band_pipeline.py THREE_WAVES); typed `/wave` is a simulation, so typed
+/// context stays local (UI memory only) and is never submitted as a gesture.
+fn sends_three_waves_context(band_mode: bool) -> bool {
+    band_mode
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sends_three_waves_context;
+
+    #[test]
+    fn only_band_context_is_labelled_three_waves() {
+        assert!(sends_three_waves_context(true));
+        assert!(!sends_three_waves_context(false)); // typed /wave never reaches /context-updates
+    }
 }
