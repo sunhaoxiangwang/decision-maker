@@ -184,7 +184,7 @@ fn judge_failure_is_unavailable_retryable_and_never_blocks_later_turns() {
     let t3 = accept(&mut s, "$1,100.", "t3");
     apply(&mut s, t3);
     let (_, conv) = judge(&mut s, Some(t3), says(Outcome::Proceed, "ok")).unwrap();
-    assert!(!conv.contains(": x"), "an unapplied turn is not in the conversation");
+    assert!(conv.contains(": x"), "a turn that failed before apply is still judged");
 }
 
 #[test]

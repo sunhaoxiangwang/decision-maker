@@ -532,7 +532,7 @@ mod tests {
         assert!(body["contents"][0]["parts"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("GOALS BEGIN\nfirm bed, $100\nGOALS END"));
+            .contains(r#""goals":"firm bed, $100""#));
         assert_eq!(
             body["generationConfig"]["responseFormat"]["text"]["schema"]["properties"]["outcome"]["enum"][0],
             "PROCEED"

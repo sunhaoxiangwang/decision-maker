@@ -1108,11 +1108,17 @@ impl Session {
             .turns
             .iter()
             .rev()
-            .filter(|t| t.server_seq <= upto && t.effect_applied)
+            // a turn that failed before apply was still said: keep it in what the judge reads
+            .filter(|t| {
+                t.server_seq <= upto
+                    && (t.effect_applied || t.status == TurnStatus::FailedBeforeApply)
+            })
         {
             let line = format!("{}: {}", t.speaker.as_deref().unwrap_or("unknown"), t.text);
             chars += line.chars().count() + 1;
             if chars > CONTEXT_MAX_CHARS || lines.len() >= CONTEXT_MAX_TURNS {
+                // never truncate silently: the judge is told earlier turns are missing
+                lines.push("(earlier turns omitted: the conversation exceeds the context window)".into());
                 break;
             }
             lines.push(line);
