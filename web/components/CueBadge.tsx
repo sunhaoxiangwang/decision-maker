@@ -25,3 +25,24 @@ export default function CueBadge({ cue, late, big }: { cue: Cue; late?: boolean;
     </span>
   );
 }
+
+// The copilot's three decisions under the band colour each one lights (docs/contract-v1.md).
+const SCALE = [
+  { cue: 'Proceed', colour: 'Green', color: 'var(--green)' },
+  { cue: 'Pause', colour: 'Red', color: 'var(--red)' },
+  { cue: 'Ask', colour: 'Amber', color: 'var(--amber)' },
+] as const;
+
+export function CueScale({ cue }: { cue: Cue }) {
+  return (
+    <ol className="scale" aria-label="Copilot decision">
+      {SCALE.map((s) => (
+        <li key={s.cue} className={s.cue === cue ? 'on' : ''} aria-current={s.cue === cue ? 'true' : undefined}
+          style={{ ['--c' as string]: s.color }}>
+          <span className="swatch">{s.colour}</span>
+          <span className="verdict">{s.cue}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}

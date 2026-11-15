@@ -3,7 +3,6 @@ import Link from 'next/link';
 import MemoryCapture from '@/components/MemoryCapture';
 import Conversation from '@/components/Conversation';
 import DecisionCard from '@/components/DecisionCard';
-import GoalsForm from '@/components/GoalsForm';
 import { decisionRequest } from '@/lib/memory';
 import { useNames } from '@/lib/names';
 import { selectedTurn, visibleTurns, type Mode, type Session } from '@/lib/store';
@@ -23,7 +22,6 @@ export default function Live() {
   const sel = selectedTurn(state);
   const turn = sel == null ? undefined : state.turns[sel];
   const d = turn?.decisionId ? state.decisions[turn.decisionId] : undefined;
-  const goalsOk = session.goals.length > 0 && session.goals.every((g) => g.confirmed);
   const empty = visibleTurns(state).length === 0;
   // What the decision API would be sent for the selected (or latest) finished turn: the
   // memory shown here is exactly what retrieval picks for it.
@@ -42,7 +40,7 @@ export default function Live() {
             <option value="negotiation">Negotiation</option>
             <option value="lunch">Lunch</option>
           </select>
-          <span className="chip">{goalsOk ? 'Goals ✓' : 'Goals not confirmed'}</span>
+          <a className="chip link" href="http://127.0.0.1:8787/" target="_blank" rel="noreferrer" title="Start a session, confirm goals and memory">Open copilot</a>
           <span className={`chip${status?.mic === 'live' ? ' rec' : ''}`}>{status ? MIC[status.mic] : 'Mic unknown'}</span>
           {state.decisionsOn !== null && (
             <span className={`chip${state.decisionsOn ? ' on' : ''}`} title="Triple-tap the band to switch">
@@ -52,7 +50,7 @@ export default function Live() {
           {state.context && <span className="chip rec">Recording memory</span>}
           {state.gesture && (
             <span key={state.gesture.time_ms} className="chip flash" role="status" aria-live="polite">
-              {state.gesture.name === 'wave' ? 'Wave' : 'Triple tap'} → {state.gesture.name === 'wave' ? 'memory' : 'decisions'} {state.gesture.on ? 'on' : 'off'} · {new Date(state.gesture.time_ms).toLocaleTimeString()}
+              {state.gesture.name === 'wave' ? 'Wave' : 'Triple tap'}: {state.gesture.name === 'wave' ? 'memory' : 'decisions'} {state.gesture.on ? 'on' : 'off'}, {new Date(state.gesture.time_ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
             </span>
           )}
           {!empty && state.decisionsOn !== false && (
@@ -64,7 +62,7 @@ export default function Live() {
           <div className="banner" role="status">
             {micUnknown
               ? 'Bridge connected, mic state not reported: assume this conversation is being recorded and sent to Deepgram.'
-              : 'Recording — audio goes to Deepgram.'}
+              : 'Recording: audio goes to Deepgram.'}
           </div>
         )}
         <div className="thread">
@@ -83,7 +81,7 @@ export default function Live() {
               <h1>Live transcript</h1>
               <p className="muted">
                 {state.decisionsOn
-                  ? "Decisions mode is on: start talking. Each speaker's words stream in here as they are spoken."
+                  ? 'Listening. Your words appear on the right, everyone else on the left, and the copilot answers in its own card.'
                   : <>Start the bridge with <code>cargo run -- --band &lt;band number&gt;</code>, then triple-tap the band to start decisions mode.</>}
               </p>
             </div>
@@ -93,9 +91,8 @@ export default function Live() {
         </div>
         <div className="dock">
           <MemoryCapture state={state} />
-          <GoalsForm session={session} save={save} />
           <p className="fine">
-            Goals, budget changes and memory are confirmed in the copilot UI (http://127.0.0.1:8787/); speech never confirms them.
+            Goals, budget changes and memory are confirmed in the copilot. Speech never confirms them.
           </p>
         </div>
       </section>

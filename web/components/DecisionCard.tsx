@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import type { ReactNode } from 'react';
 import { ago, type Decision, type Option, type Session, type Turn } from '@/lib/store';
-import CueBadge, { CUES, Dot } from './CueBadge';
+import CueBadge, { CUES, CueScale, Dot } from './CueBadge';
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -18,7 +18,7 @@ export default function DecisionCard({ turn, d, options }: { turn?: Turn; d?: De
   const late = (turn?.shown ?? d?.shown) === false;
   return (
     <div className="card">
-      <CueBadge cue={cue} late={late} big />
+      {['Proceed', 'Pause', 'Ask'].includes(cue) ? <CueScale cue={cue} /> : <CueBadge cue={cue} late={late} big />}
       {late && <p className="muted">late — not sent to band</p>}
       {!d && <p className="muted">The bridge sent this cue. Its reason, facts and memory show here once the orchestrator publishes <code>decision</code> events.</p>}
       {d && (

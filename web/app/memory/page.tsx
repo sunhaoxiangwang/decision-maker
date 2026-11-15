@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import MemoryList from '@/components/MemoryList';
-import { extractMemory, rememberContext } from '@/lib/api';
+import { extractMemory } from '@/lib/api';
 import { asPrompt, forDecision, transcriptLines } from '@/lib/memory';
 import { useNames } from '@/lib/names';
 import { ago, type Conversation, type MemoryEvent, type MemoryItem } from '@/lib/store';
@@ -31,18 +31,6 @@ export default function MemoryPage() {
   const uses: Record<string, number> = {};
   for (const d of Object.values(state.decisions)) for (const m of d.memory_used) uses[m.id] = (uses[m.id] ?? 0) + 1;
   const conversations = Object.values(state.conversations).sort((a, b) => b.started_ms - a.started_ms);
-
-  async function addContext(form: HTMLFormElement) {
-    const text = String(new FormData(form).get('context') ?? '').trim();
-    if (!text) return;
-    setBusy('context');
-    setNotice('');
-    const { items, warning } = await rememberContext(text);
-    items.forEach((m) => change('confirmed', m));
-    setNotice(warning ?? (items.length ? '' : 'Nothing in that text looked worth remembering.'));
-    form.reset();
-    setBusy(null);
-  }
 
   async function extract(c: Conversation) {
     setBusy(c.id);
@@ -74,15 +62,8 @@ export default function MemoryPage() {
         link.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }}>Export history and memory</button>
-      <p className="muted">Wave to record; wave again to stop. Spoken updates are saved word for word as proposals: confirm them here, and confirm goal or budget changes in the copilot UI (http://127.0.0.1:8787/). Speech never confirms anything.</p>
+      <p className="muted">Wave the band to record an update, and wave again to stop. Each update is saved word for word as a proposal below; confirm the ones that are right. Goal and budget changes are confirmed in the copilot.</p>
 
-      <form className="context" onSubmit={(e) => { e.preventDefault(); addContext(e.currentTarget); }}>
-        <textarea
-          name="context" rows={3} aria-label="Context to remember"
-          placeholder={'Tell it what to remember for this negotiation, e.g. "Queen, firm mattress. At most $1,200 including delivery. I need at least a 100-night return."'}
-        />
-        <button className="send" disabled={busy === 'context'}>{busy === 'context' ? 'Saving…' : 'Remember'}</button>
-      </form>
       {notice && <p className="notice" role="status">{notice}</p>}
 
       <h2>Proposed</h2>

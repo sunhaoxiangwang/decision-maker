@@ -156,3 +156,58 @@ td.note small { display: block; }
 .chip.flash { animation: flash 1.2s ease-out; }
 @keyframes flash { from { background: var(--hover); color: inherit; } }
 @media (prefers-reduced-motion: reduce) { .chip.flash { animation: none; } }
+
+/* Conversation: You right (teal), Others left (neutral), Copilot its own card edged in the cue colour */
+:root { --you: #0f5e63; --on-you: #f2fbfb; --others: #efeae4; --agent-bg: #fbfaf8; }
+@media (prefers-color-scheme: dark) { :root { --you: #1d7f86; --on-you: #f2fbfb; --others: #34312e; --agent-bg: #262626; } }
+.thread { padding: 24px clamp(16px, 4vw, 40px); }
+.topbar { padding: 14px clamp(16px, 4vw, 40px); gap: 10px; }
+.banner { margin: 0 clamp(16px, 4vw, 40px) 4px; }
+.dock { padding: 12px clamp(16px, 4vw, 40px) 18px; display: grid; gap: 10px; }
+.agent { align-self: stretch; display: grid; gap: 8px; justify-items: start; text-align: left; padding: 14px 18px 16px;
+  background: var(--agent-bg); border: 1px solid var(--line); border-left: 4px solid var(--cue); border-radius: 14px; }
+.agent:hover { border-color: var(--cue); }
+.agent p { margin: 0; max-width: 65ch; }
+.agent .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip.link { color: var(--text); }
+.chip.link:hover { background: var(--hover); }
+
+/* Memory recording panel */
+.recorder { display: grid; gap: 8px; padding: 16px 18px; border-radius: 16px; border: 1px solid color-mix(in srgb, var(--red) 45%, var(--line));
+  background: color-mix(in srgb, var(--red) 6%, var(--bg)); max-height: 40dvh; overflow: auto; }
+.recorder header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.recorder header .muted { margin-left: auto; font-size: 13px; }
+.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); animation: speaking 1.4s ease-in-out infinite; }
+.recorder .heard { margin: 0; padding: 8px 12px; border-left: 3px solid color-mix(in srgb, var(--red) 50%, transparent); background: var(--bg); border-radius: 4px 10px 10px 4px; white-space: pre-wrap; }
+.recorder .heard.interim { color: var(--muted); font-style: italic; }
+.recorder .fine { text-align: left; margin: 0; }
+@media (prefers-reduced-motion: reduce) { .rec-dot { animation: none; } }
+@media (max-width: 600px) { .agent { padding: 12px 14px; } .pane { padding: 16px; } }
+
+/* Decision scale: Green / Red / Amber with the decision under each; the current one is lit */
+.scale { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; width: 100%; max-width: 420px; margin: 0; padding: 0; }
+.scale li { display: grid; gap: 6px; padding: 0; text-align: center; opacity: .45; }
+.scale .swatch { display: block; padding: 8px 6px; border-radius: 10px; font-size: 13px; font-weight: 600;
+  border: 1.5px solid var(--c); color: var(--text); background: color-mix(in srgb, var(--c) 12%, transparent); }
+.scale .verdict { font-size: 13px; color: var(--muted); }
+.scale li.on { opacity: 1; }
+.scale li.on .swatch { background: var(--c); color: #111; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 30%, transparent); }
+.scale li.on .verdict { color: var(--text); font-weight: 600; }
+
+/* v2: all speech on the right with real gaps; the copilot on the left */
+.convo { display: flex; flex-direction: column; gap: 12px; }
+.convo .exchange { display: flex; flex-direction: column; gap: 12px; margin: 0; }
+.convo .bubble { align-self: flex-end; max-width: min(78%, 560px); padding: 12px 18px; line-height: 1.5;
+  border-radius: 20px 20px 6px 20px; background: var(--others); }
+.convo .bubble.you { background: var(--you); color: var(--on-you); }
+.convo .bubble.you.interim { color: color-mix(in srgb, var(--on-you) 75%, transparent); }
+.convo .bubble.sel { box-shadow: 0 0 0 2px var(--text); }
+.convo .agent { align-self: flex-start; width: min(100%, 560px); margin-block: 4px; cursor: default; }
+.convo .agent > .ghost { justify-self: start; padding-left: 0; font-size: 13px; }
+.agent-context { width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 0 12px; background: var(--bg); }
+.agent-context summary { margin: 0; padding: 8px 0; font-size: 13px; color: var(--muted); }
+.agent-context[open] { padding-bottom: 10px; }
+.agent-context ul { margin: 0; display: grid; gap: 6px; }
+.agent-context li { padding: 6px 10px; border-radius: 8px; background: var(--hover); font-size: 14px; }
+.agent-context p { margin: 8px 0 6px; font-size: 13px; }
+@media (max-width: 600px) { .convo .bubble { max-width: 92%; } }

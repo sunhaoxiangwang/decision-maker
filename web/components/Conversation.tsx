@@ -1,59 +1,60 @@
 'use client';
 import { useEffect, useRef } from 'react';
-import { fallbackName, useNames } from '@/lib/names';
 import { selectedTurn, visibleTurns, type State } from '@/lib/store';
-import CueBadge, { Dot } from './CueBadge';
+import CueBadge, { CUES, CueScale } from './CueBadge';
 
-const COLORS = ['#10a37f', '#5436da', '#e2622b', '#d6336c', '#0b84d8', '#8a7300'];
-
+// Speech on the right (the band wearer, speaker 0, in a darker bubble); the copilot's answer
+// on the left: what it was given (collapsed), then its decision under the band colours.
 export default function Conversation({ state, onPick }: { state: State; onPick: (turn_id: number) => void }) {
-  const { names, rename } = useNames();
   const end = useRef<HTMLDivElement>(null);
   const turns = visibleTurns(state);
   const last = turns.at(-1);
   const selected = selectedTurn(state);
 
-  useEffect(() => { end.current?.scrollIntoView({ block: 'end' }); }, [turns.length, last?.text]);
+  useEffect(() => { end.current?.scrollIntoView({ block: 'end' }); }, [turns.length, last?.text, last?.cue]);
 
   return (
-    <div className="col">
-      {turns.map((t, i) => {
+    <div className="col convo">
+      {turns.map((t) => {
         const d = t.decisionId ? state.decisions[t.decisionId] : undefined;
         const cue = t.cue ?? d?.cue;
-        const key = String(t.speaker ?? 'unknown');
-        const fallback = fallbackName(t.speaker);
-        const name = names[key] ?? '';
-        // Speech arrives as one turn per pause, so one person often fills several turns in
-        // a row: name them once, until someone else speaks or the agent answers.
-        const prev = turns[i - 1];
-        const grouped = prev !== undefined && prev.speaker === t.speaker && !prev.cue && !prev.decisionId;
         return (
-          <article key={t.turn_id} className={`turn${selected === t.turn_id ? ' sel' : ''}${grouped ? ' grouped' : ''}`}>
-            <div className="who">
-              {!grouped && (
-                <>
-                  <Dot color={COLORS[(t.speaker ?? COLORS.length - 1) % COLORS.length]} />
-                  <input
-                    aria-label={`Name for ${fallback}`} title="Click to rename"
-                    value={name} placeholder={fallback} size={Math.max((name || fallback).length, 4)}
-                    onChange={(e) => rename(key, e.target.value)}
-                  />
-                </>
-              )}
-              <span className="muted">t{t.turn_id}</span>
-            </div>
+          <div key={t.turn_id} className="exchange">
             {t.text && (
-              <button className={`bubble${t.final ? '' : ' interim'}`} onClick={() => onPick(t.turn_id)}>
+              <button className={`bubble ${t.speaker === 0 ? 'you' : 'others'}${t.final ? '' : ' interim'}${selected === t.turn_id ? ' sel' : ''}`}
+                onClick={() => onPick(t.turn_id)}>
                 {t.text}
               </button>
             )}
             {cue && (
-              <button className="reply" onClick={() => onPick(t.turn_id)}>
-                <CueBadge cue={cue} late={t.shown === false} />
-                <span>{t.shown === false ? 'late — not sent to band' : d?.reason}</span>
-              </button>
+              <article className="agent" style={{ ['--cue' as string]: CUES[cue]?.color ?? 'var(--line)' }}>
+                {d && (d.context?.length || d.memory_used.length > 0) ? (
+                  <details className="agent-context">
+                    <summary>Context</summary>
+                    {d.context && d.context.length > 0 && (
+                      <ul>{d.context.map((c) => <li key={c.turn_id}>{c.text}</li>)}</ul>
+                    )}
+                    {d.memory_used.length > 0 && (
+                      <>
+                        <p className="muted">Memory used</p>
+                        <ul>{d.memory_used.map((m) => <li key={m.id}>{m.text}</li>)}</ul>
+                      </>
+                    )}
+                  </details>
+                ) : null}
+                {['Proceed', 'Pause', 'Ask'].includes(cue) ? <CueScale cue={cue} /> : <CueBadge cue={cue} late={t.shown === false} />}
+                {t.shown === false && <p className="muted">Arrived late, so the band was not lit.</p>}
+                {d?.reason && <p>{d.reason}</p>}
+                {d && (d.conflicts.length > 0 || d.missing.length > 0) && (
+                  <div className="tags">
+                    {d.conflicts.map((c) => <span key={c} className="tag red">{c}</span>)}
+                    {d.missing.map((m) => <span key={m} className="tag amber">{m}</span>)}
+                  </div>
+                )}
+                <button className="ghost" onClick={() => onPick(t.turn_id)}>Show details</button>
+              </article>
             )}
-          </article>
+          </div>
         );
       })}
       <div ref={end} />
